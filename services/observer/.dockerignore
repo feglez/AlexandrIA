@@ -1,0 +1,7 @@
+# Only pyproject.toml, uv.lock and src/ are needed to build the image.
+.venv
+tests
+**/__pycache__
+.pytest_cache
+.ruff_cache
+.env*
