@@ -16,8 +16,13 @@ venv/
 .coverage
 htmlcov/
 
-# Local environment variables
+# Local environment variables (.env.example is the committed template)
 .env
+.env.*
+!.env.example
+
+# Local compose overrides
+compose.override.yaml
 
 # Editors and OS
 .vscode/
