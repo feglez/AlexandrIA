@@ -1,0 +1,24 @@
+# Lint and format settings for the three services (services/*).
+line-length = 100
+target-version = "py313"
+
+[lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # import sorting
+    "UP",    # newer Python syntax
+    "B",     # likely bugs
+    "SIM",   # simpler code
+    "ASYNC", # blocking calls in async code
+    "S",     # security
+    "RUF",   # ruff-specific rules
+]
+
+[lint.per-file-ignores]
+# assert is how pytest checks results
+"**/tests/**" = ["S101", "S105", "S106"]
+
+[lint.isort]
+known-first-party = ["watchman", "librarian", "observer"]
