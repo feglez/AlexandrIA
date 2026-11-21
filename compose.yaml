@@ -1,0 +1,264 @@
+# Local environment: Nextcloud, the three AlexandrIA services, PostgreSQL,
+# Redis and (profile "llm") Ollama. Start everything with:
+#
+#   cp .env.example .env
+#   docker compose up -d --wait
+#
+# Networks:
+#   frontend  the only network with published ports (all bound to 127.0.0.1)
+#   backend   internal network for PostgreSQL, Redis, Ollama and everything
+#             that talks to them: no Internet access, and its bridge has no
+#             address on the host, so the host cannot connect to it either
+#   egress    gives Ollama Internet access to download the model
+
+name: alexandria
+
+x-nextcloud-env: &nextcloud-env
+  REDIS_HOST: redis
+  REDIS_HOST_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+
+x-nextcloud-volumes: &nextcloud-volumes
+  - nextcloud-html:/var/www/html
+  - nextcloud-data:/var/www/html/data
+
+# Health check of our services. The slim images have no curl.
+x-service-healthcheck: &service-healthcheck
+  test:
+    - CMD
+    - python
+    - -c
+    - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)
+  interval: 15s
+  timeout: 5s
+  retries: 3
+  start_period: 30s
+  start_interval: 2s
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.7-pg17-trixie
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      # Read by compose/postgres/initdb/01-databases.sh
+      NEXTCLOUD_DB_PASSWORD: ${NEXTCLOUD_DB_PASSWORD:?set NEXTCLOUD_DB_PASSWORD in .env}
+      WATCHMAN_DB_PASSWORD: ${WATCHMAN_DB_PASSWORD:?set WATCHMAN_DB_PASSWORD in .env}
+      LIBRARIAN_DB_PASSWORD: ${LIBRARIAN_DB_PASSWORD:?set LIBRARIAN_DB_PASSWORD in .env}
+      OBSERVER_DB_PASSWORD: ${OBSERVER_DB_PASSWORD:?set OBSERVER_DB_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./compose/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    networks: [backend]
+    healthcheck:
+      # Over TCP: during the first start the init scripts run on a temporary
+      # server that only listens on the Unix socket.
+      test: ["CMD", "pg_isready", "--host=127.0.0.1", "--username=postgres"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 2s
+
+  redis:
+    image: redis:8.8.4-alpine
+    restart: unless-stopped
+    # Append-only file so the event stream survives restarts.
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+
+  nextcloud:
+    image: nextcloud:35.0.3-apache
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *nextcloud-env
+      # Automatic installation on the first start
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: ${NEXTCLOUD_DB_PASSWORD}
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER:?set NEXTCLOUD_ADMIN_USER in .env}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:?set NEXTCLOUD_ADMIN_PASSWORD in .env}
+      # "nextcloud" is the host name the services use
+      NEXTCLOUD_TRUSTED_DOMAINS: localhost nextcloud
+      # Read by compose/nextcloud/hooks/post-installation/10-alexandria.sh
+      ALEXANDRIA_SERVICE_PASSWORD: ${ALEXANDRIA_SERVICE_PASSWORD:?set ALEXANDRIA_SERVICE_PASSWORD in .env}
+      OBSERVER_ACCOUNT_PASSWORD: ${OBSERVER_ACCOUNT_PASSWORD:?set OBSERVER_ACCOUNT_PASSWORD in .env}
+      DEMO_ALICE_PASSWORD: ${DEMO_ALICE_PASSWORD:?set DEMO_ALICE_PASSWORD in .env}
+      DEMO_BOB_PASSWORD: ${DEMO_BOB_PASSWORD:?set DEMO_BOB_PASSWORD in .env}
+      DEMO_CAROL_PASSWORD: ${DEMO_CAROL_PASSWORD:?set DEMO_CAROL_PASSWORD in .env}
+    volumes:
+      - nextcloud-html:/var/www/html
+      - nextcloud-data:/var/www/html/data
+      - ./compose/nextcloud/hooks/post-installation:/docker-entrypoint-hooks.d/post-installation:ro
+    networks: [frontend, backend]
+    ports:
+      - 127.0.0.1:8080:80
+    healthcheck:
+      # status.php answers before the installation is complete, so check the flag.
+      test: ["CMD-SHELL", "curl -fsS http://localhost/status.php | grep -q '\"installed\":true'"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      # The first start installs Nextcloud, which takes a few minutes.
+      start_period: 5m
+      start_interval: 5s
+
+  # Runs Nextcloud's background jobs every 5 minutes.
+  nextcloud-cron:
+    image: nextcloud:35.0.3-apache
+    restart: unless-stopped
+    entrypoint: /cron.sh
+    depends_on:
+      nextcloud:
+        condition: service_healthy
+    environment: *nextcloud-env
+    volumes: *nextcloud-volumes
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "busybox ps | grep -q '[c]rond'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # One-shot job: creates the library folders, the share with the members and
+  # the sub-admin rights. It is idempotent and runs on every "up".
+  bootstrap:
+    image: ghcr.io/feglez/alexandria-watchman:${IMAGE_TAG:-dev}
+    command: ["python", "-m", "watchman.bootstrap"]
+    depends_on:
+      nextcloud:
+        condition: service_healthy
+    environment:
+      NEXTCLOUD_URL: http://nextcloud
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD}
+      NEXTCLOUD_SERVICE_USER: alexandria
+      NEXTCLOUD_SERVICE_PASSWORD: ${ALEXANDRIA_SERVICE_PASSWORD}
+      LIBRARY_COLLECTIONS: ${LIBRARY_COLLECTIONS:-Manuals,Invoices,Contracts,Medical,School,Taxes}
+    networks: [backend]
+
+  ollama:
+    image: ollama/ollama:0.40.16
+    profiles: [llm]
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    networks: [backend, egress]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+
+  # One-shot job: downloads the model into the ollama-models volume (only the
+  # first time, later runs find it already there).
+  ollama-pull:
+    image: ollama/ollama:0.40.16
+    profiles: [llm]
+    command: ["pull", "${OLLAMA_MODEL:-qwen2.5:1.5b}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: ollama:11434
+    networks: [backend]
+
+  watchman:
+    image: ghcr.io/feglez/alexandria-watchman:${IMAGE_TAG:-dev}
+    build: services/watchman
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql+asyncpg://watchman:${WATCHMAN_DB_PASSWORD}@postgres:5432/watchman
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      NEXTCLOUD_URL: http://nextcloud
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+    networks: [frontend, backend]
+    ports:
+      - 127.0.0.1:8081:8000
+    healthcheck: *service-healthcheck
+
+  librarian:
+    image: ghcr.io/feglez/alexandria-librarian:${IMAGE_TAG:-dev}
+    build: services/librarian
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nextcloud:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+        # Without the "llm" profile librarian still starts.
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://librarian:${LIBRARIAN_DB_PASSWORD}@postgres:5432/librarian
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      NEXTCLOUD_URL: http://nextcloud
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+    networks: [frontend, backend]
+    ports:
+      - 127.0.0.1:8082:8000
+    healthcheck: *service-healthcheck
+
+  observer:
+    image: ghcr.io/feglez/alexandria-observer:${IMAGE_TAG:-dev}
+    build: services/observer
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nextcloud:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://observer:${OBSERVER_DB_PASSWORD}@postgres:5432/observer
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      NEXTCLOUD_URL: http://nextcloud
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+    networks: [frontend, backend]
+    ports:
+      - 127.0.0.1:8083:8000
+    healthcheck: *service-healthcheck
+
+networks:
+  frontend: {}
+  backend:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.inhibit_ipv4: "true"
+  egress: {}
+
+volumes:
+  postgres-data: {}
+  redis-data: {}
+  nextcloud-html: {}
+  nextcloud-data: {}
+  ollama-models: {}
