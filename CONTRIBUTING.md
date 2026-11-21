@@ -23,13 +23,15 @@ The project follows a **trunk-based workflow with short-lived feature branches**
 | `test/`     | Tests only                                        | `test/7-search-integration`           |
 | `chore/`    | Maintenance (dependencies, configuration)         | `chore/bump-fastapi`                  |
 | `build/`    | Container images, compose, build configuration    | `build/12-local-environment`          |
+| `ci/`       | Continuous integration workflow                   | `ci/13-continuous-integration`        |
 
 ### Merge policy
 
 - PRs are merged with **squash merge**, so each PR becomes one Conventional Commit on `main`.
 - A PR must reference the user story it implements (`Closes #<n>`).
+- The CI workflow must be green before merging. Its `ci-ok` job fails unless every other job passed (see [README section 9](README.md#9-continuous-integration)).
 
-Repository settings (*Settings → Rules → Rulesets* for `main`): require a pull request before merging, block force pushes, and allow only squash merges.
+Repository settings (*Settings → Rules → Rulesets* for `main`): require a pull request before merging, require the `ci-ok` status check to pass, block force pushes, and allow only squash merges.
 
 ## Commit convention
 
@@ -43,9 +45,9 @@ Commits follow [Conventional Commits 1.0.0](https://www.conventionalcommits.org/
 [optional footer: Closes #12, BREAKING CHANGE: ...]
 ```
 
-**Types:** `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `build` (Dockerfiles, `compose.yaml` and build configuration).
+**Types:** `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `build` (Dockerfiles, `compose.yaml` and build configuration), `ci` (GitHub Actions workflows).
 
-**Scopes:** `watchman`, `librarian`, `observer`, `nextcloud`, `docs`.
+**Scopes:** `watchman`, `librarian`, `observer`, `nextcloud`, `docs`, `ci`.
 
 Examples:
 
@@ -55,6 +57,7 @@ fix(librarian): skip empty chunks when indexing scanned PDFs
 docs: add NIST SP 500-292 actor mapping
 chore: add pull request template
 build(librarian): bake the embedding model into the image
+ci: build the arm64 images on a native runner
 ```
 
 ## From user story to `main`
@@ -63,7 +66,7 @@ build(librarian): bake the embedding model into the image
 2. Create a branch following the naming convention above.
 3. Commit using Conventional Commits; tick the issue checklist as tasks are completed.
 4. Open a pull request with the PR template and `Closes #<n>`.
-5. Once the checklist is complete, squash-merge and delete the branch.
+5. Once the checklist is complete and CI is green, squash-merge and delete the branch.
 
 ## Local development
 
@@ -97,3 +100,5 @@ docker stop test-pg test-redis
 ```
 
 Without `TEST_DATABASE_URL` and `TEST_REDIS_URL` the integration tests are skipped (they fail instead when the `CI` variable is set). Each run recreates the database `test_<service>`. Nextcloud is never called for real in these tests: its answers are mocked with respx.
+
+**CI** runs the same linters and tests, with the same tool versions, on every pull request. It also builds the images for amd64 and arm64 and starts the compose stack (see [README section 9](README.md#9-continuous-integration)).
