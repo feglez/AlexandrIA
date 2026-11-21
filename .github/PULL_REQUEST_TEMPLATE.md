@@ -12,6 +12,7 @@ Closes #<!-- issue number -->
 - [ ] `refactor` - code change with no behaviour change
 - [ ] `test` - tests only
 - [ ] `chore` - maintenance
+- [ ] `build` - container images, compose, build configuration
 
 ## Affected components
 
@@ -19,6 +20,7 @@ Closes #<!-- issue number -->
 - [ ] librarian
 - [ ] observer
 - [ ] nextcloud
+- [ ] infrastructure / CI
 - [ ] documentation
 
 ## How has this been tested?
