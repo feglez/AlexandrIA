@@ -3,113 +3,19 @@ and Redis. Nextcloud and observer are mocked with respx."""
 
 import hashlib
 import json
-from collections.abc import AsyncIterator
 
 import httpx
 import pytest
 import respx
 from fastapi import FastAPI
-from sqlalchemy import func, select, text
-from ulid import ULID
+from sqlalchemy import func, select
 
 from tests import samples
-from tests.conftest import NEXTCLOUD, basic_auth
-from tests.unit.test_files import multistatus
-from watchman.app import create_public_app
-from watchman.config import Settings
+from tests.conftest import basic_auth
+from tests.integration.conftest import ALICE, ALLOWED, DAV_PATH, events, stored, submit
 from watchman.db.models import LibraryFile, StatusChange, Submission
 from watchman.policy import Policy, active_policy
 from watchman.resources import Resources
-
-OBSERVER = "http://observer.test:8001"
-DAV = f"{NEXTCLOUD}/remote.php/dav/files/alexandria"
-DAV_PATH = "/remote.php/dav/files/alexandria"
-ALICE = ("alice", "alice-app-password")
-ALLOWED = {"allowed": True, "remaining_bytes": 4_079_736_799, "remaining_submissions": 35}
-
-
-def nextcloud_user(request: httpx.Request) -> httpx.Response:
-    if request.headers.get("Authorization") != basic_auth(*ALICE):
-        return httpx.Response(401)
-    data = {"id": "alice", "displayname": "Alice", "groups": ["members"]}
-    return httpx.Response(200, json={"ocs": {"meta": {"statuscode": 200}, "data": data}})
-
-
-@pytest.fixture
-async def resources(migrated_database_url: str, redis_url: str) -> AsyncIterator[Resources]:
-    settings = Settings(
-        database_url=migrated_database_url,
-        redis_url=redis_url,
-        nextcloud_url=NEXTCLOUD,
-        public_base_url="https://alexandria.test",
-        nextcloud_service_password="service-password",
-        observer_internal_url=OBSERVER,
-        observer_internal_token="observer-token",
-        events_stream=f"test.events.{ULID()}",
-    )
-    resources = Resources.from_settings(settings)
-    async with resources.engine.begin() as connection:
-        await connection.execute(text("TRUNCATE submissions, status_history, library_files"))
-    yield resources
-    await resources.redis.delete(settings.events_stream)
-    await resources.aclose()
-
-
-@pytest.fixture
-def app(resources: Resources) -> FastAPI:
-    return create_public_app(resources)
-
-
-@pytest.fixture
-async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client
-
-
-@pytest.fixture
-def mocked() -> respx.MockRouter:
-    library = f"{DAV_PATH}/Library"
-    with respx.mock(assert_all_called=False) as router:
-        router.get(f"{NEXTCLOUD}/ocs/v2.php/cloud/user", name="auth").mock(
-            side_effect=nextcloud_user
-        )
-        router.route(method="PROPFIND", url=f"{DAV}/Library", name="collections").respond(
-            207, text=multistatus(f"{library}/", f"{library}/Manuals/", f"{library}/Taxes/")
-        )
-        router.route(
-            method="MKCOL", url__regex=rf"{DAV}/Quarantine/sub_\w+$", name="mkcol"
-        ).respond(201)
-        router.put(url__startswith=f"{DAV}/Quarantine/", name="put").respond(201)
-        router.delete(url__startswith=f"{DAV}/Quarantine/", name="delete").respond(204)
-        router.post(f"{OBSERVER}/internal/quota-checks", name="quota").respond(json=ALLOWED)
-        yield router
-
-
-async def submit(
-    client: httpx.AsyncClient,
-    content: bytes = samples.PDF,
-    filename: str = "warranty.pdf",
-    collection: str = "Manuals",
-    auth: tuple[str, str] | None = ALICE,
-    **data: str,
-) -> httpx.Response:
-    return await client.post(
-        "/api/v1/submissions",
-        files={"file": (filename, content, "application/octet-stream")},
-        data={"collection": collection, **data},
-        auth=auth,
-    )
-
-
-async def stored(resources: Resources) -> list[Submission]:
-    async with resources.sessions() as session:
-        return list(await session.scalars(select(Submission)))
-
-
-async def events(resources: Resources) -> list[dict]:
-    entries = await resources.redis.xrange(resources.settings.events_stream)
-    return [json.loads(fields[b"event"]) for _, fields in entries]
 
 
 async def test_accepted_submission(
