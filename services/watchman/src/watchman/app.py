@@ -8,7 +8,7 @@ from importlib.metadata import version
 
 from fastapi import FastAPI
 
-from watchman.api import collections, health, review, submissions
+from watchman.api import collections, health, policies, review, submissions
 from watchman.problems import install_problem_handlers
 from watchman.resources import Resources
 
@@ -21,6 +21,7 @@ def create_public_app(resources: Resources) -> FastAPI:
     app.include_router(collections.router)
     app.include_router(submissions.router)
     app.include_router(review.router)
+    app.include_router(policies.router)
     return app
 
 

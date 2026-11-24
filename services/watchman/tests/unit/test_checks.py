@@ -6,9 +6,9 @@ import pytest
 from tests import samples
 from watchman import checks
 from watchman.checks import Check, FileFacts, QuotaAnswer
-from watchman.policy import DOCX, Policy
+from watchman.policy import DEFAULT_POLICY, DOCX
 
-POLICY = Policy()
+POLICY = DEFAULT_POLICY
 
 
 def facts(size_bytes: int = 1000, mime_type: str = "application/pdf") -> FileFacts:

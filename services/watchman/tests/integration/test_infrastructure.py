@@ -25,7 +25,7 @@ async def test_service_reaches_postgres_and_redis(
     try:
         async with resources.engine.connect() as connection:
             revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
-        assert revision == "0003"
+        assert revision == "0004"
         assert await resources.redis.ping()
 
         transport = httpx.ASGITransport(app=create_public_app(resources))

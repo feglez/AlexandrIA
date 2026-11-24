@@ -30,10 +30,12 @@ env OC_PASS="$ALEXANDRIA_SERVICE_PASSWORD" php /var/www/html/occ user:add \
 env OC_PASS="$OBSERVER_ACCOUNT_PASSWORD" php /var/www/html/occ user:add \
     --password-from-env --display-name "AlexandrIA observer" observer
 
-# Demo household: alice and bob are members, carol is also a curator.
+# Demo household: alice and bob are members, carol is also a curator. bob is
+# also in "trusted", whose submissions the default policy can approve without
+# a curator.
 env OC_PASS="$DEMO_ALICE_PASSWORD" php /var/www/html/occ user:add \
     --password-from-env --display-name "Alice" --group members alice
 env OC_PASS="$DEMO_BOB_PASSWORD" php /var/www/html/occ user:add \
-    --password-from-env --display-name "Bob" --group members bob
+    --password-from-env --display-name "Bob" --group members --group trusted bob
 env OC_PASS="$DEMO_CAROL_PASSWORD" php /var/www/html/occ user:add \
     --password-from-env --display-name "Carol" --group members --group curators carol

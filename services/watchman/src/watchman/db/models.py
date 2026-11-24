@@ -72,6 +72,8 @@ class Submission(Base):
     publish_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
+    # Version of the moderation policy the submission was checked with.
+    policy_version: Mapped[int] = mapped_column(ForeignKey("policies.version"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
@@ -110,3 +112,15 @@ class LibraryFile(Base):
     published_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class PolicyVersion(Base):
+    """One version of the moderation policy. The latest one is active."""
+
+    __tablename__ = "policies"
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    # The policy document, as validated by watchman.policy.Policy.
+    document: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_by: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
