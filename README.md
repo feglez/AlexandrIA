@@ -1,5 +1,7 @@
 # AlexandrIA - a curated private cloud library
 
+[![CI](https://github.com/feglez/AlexandrIA/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/feglez/AlexandrIA/actions/workflows/ci.yml)
+
 > Cloud-native business layer on top of a self-hosted **Nextcloud**, running on a **Raspberry Pi 4** as an on-premises private cloud (K3s).
 >
 > Lab project for *Cloud Computing: Fundamentals and Infrastructures* (2026-27). **Current status: Hito 1 - project definition, business model and reference architecture.**
@@ -14,6 +16,7 @@
 6. [Engineering workflow](#6-engineering-workflow)
 7. [Local environment](#7-local-environment)
 8. [Container images](#8-container-images)
+9. [Continuous integration](#9-continuous-integration)
 
 ---
 
@@ -698,3 +701,52 @@ From `docker images` on amd64. "Compressed" is what a pull downloads; Docker 29'
 | `alexandria-librarian` | 1.04 GB | 358 MB |
 
 watchman and observer add about 76 MB of virtualenv to the base image. In librarian, the virtualenv takes 287 MB (onnxruntime and numpy are the largest packages) and the model 241 MB.
+
+---
+
+## 9. Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) is a GitHub Actions workflow that checks every change and publishes the service images to GitHub Container Registry (GHCR). Its runs are listed in the [Actions tab](https://github.com/feglez/AlexandrIA/actions/workflows/ci.yml).
+
+### 9.1 Triggers
+
+| Event | What runs |
+|---|---|
+| Pull request to `main` | All the checks. The images are built for both architectures but not pushed |
+| Push to `main` | All the checks, and then the images are published with the commit tag |
+| Push of a tag `v*` | The same, and the images also get the version tags |
+| Manual run (`workflow_dispatch`) | The same as a pull request |
+
+A new push to a pull request cancels the run that was in progress for it. Runs on `main` and on tags are never cancelled, so every commit on `main` gets its images.
+
+### 9.2 Jobs
+
+| Job | What it does |
+|---|---|
+| `lint` | `ruff check` and `ruff format --check` on `services/`, hadolint on the three Dockerfiles, and `docker compose config` with a copy of `.env.example` |
+| `test` | One job per service. It installs the locked dependencies with `uv sync --locked` and runs the unit and integration tests with pytest. PostgreSQL with pgvector and Redis run as service containers, from the same images as in `compose.yaml`. Nextcloud is mocked |
+| `build` | One job per service and architecture. It builds the image for `linux/amd64` on an x64 runner and for `linux/arm64` on an Arm runner, with a layer cache per service and architecture. On `main` and on tags it also pushes the image to GHCR by digest, without a tag |
+| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports |
+| `publish` | Only on `main` and on tags, once the four jobs above have passed. One job per service: it joins the two images pushed by `build` into one multi-arch image and gives it its tags (9.3) |
+| `ci-ok` | Fails unless every other job succeeded (`publish` is skipped on pull requests). It is the only status check that the `main` ruleset requires, so the ruleset does not depend on the names of the matrix jobs |
+
+The jobs run on `ubuntu-26.04` runners, which have the same major versions of Docker Engine and Docker Compose as the machine where the local environment was tested (section 7). The arm64 images are built on `ubuntu-26.04-arm`, a native Arm runner, so the Raspberry Pi's architecture is built without emulation.
+
+The tools have the same pinned versions as in [CONTRIBUTING.md](CONTRIBUTING.md#local-development) (uv 0.13.9, ruff 0.17.6, hadolint 2.15.1), and every action is pinned to the commit of a release. The workflow token is read-only, and only `build` and `publish` may write packages.
+
+### 9.3 Published images
+
+| Image | Built from |
+|---|---|
+| [`ghcr.io/feglez/alexandria-watchman`](https://github.com/users/feglez/packages/container/package/alexandria-watchman) | `services/watchman` |
+| [`ghcr.io/feglez/alexandria-librarian`](https://github.com/users/feglez/packages/container/package/alexandria-librarian) | `services/librarian` |
+| [`ghcr.io/feglez/alexandria-observer`](https://github.com/users/feglez/packages/container/package/alexandria-observer) | `services/observer` |
+
+| Tag | Set on | Example |
+|---|---|---|
+| `sha-<first 7 characters of the commit>` | Every commit on `main` and every version tag | `sha-1a2b3c4` |
+| `X.Y.Z` and `X.Y` | A tag `vX.Y.Z` | `0.2.0` and `0.2` |
+
+There is no `latest` tag, so whoever runs an image always names the commit or the version. Each tag is a multi-arch manifest for `linux/amd64` and `linux/arm64`: `docker pull` downloads the right image on a PC and on the Raspberry Pi. The images carry the OCI labels generated by `docker/metadata-action` (source repository, revision and version), which link each package to this repository.
+
+To run the local environment with published images instead of building them, set `IMAGE_TAG` in `.env` to one of these tags and run `docker compose pull` (7.5).

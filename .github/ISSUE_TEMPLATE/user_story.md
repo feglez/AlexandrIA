@@ -16,7 +16,7 @@ assignees: ''
 
 <!-- Optional: why this matters now, related services, links to the README sections or other issues. -->
 
-**Affected components:** <!-- watchman | librarian | observer | nextcloud | docs -->
+**Affected components:** <!-- watchman | librarian | observer | nextcloud | infra | ci-cd | docs -->
 
 ## Acceptance criteria
 

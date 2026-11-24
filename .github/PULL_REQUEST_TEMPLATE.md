@@ -13,6 +13,7 @@ Closes #<!-- issue number -->
 - [ ] `test` - tests only
 - [ ] `chore` - maintenance
 - [ ] `build` - container images, compose, build configuration
+- [ ] `ci` - continuous integration workflow
 
 ## Affected components
 
@@ -32,6 +33,7 @@ Closes #<!-- issue number -->
 - [ ] The branch follows the naming convention (`feat/...`, `fix/...`, `docs/...`, ...).
 - [ ] Commits follow Conventional Commits.
 - [ ] Tests were added or updated and pass locally.
+- [ ] The CI workflow is green.
 - [ ] No secrets or credentials are committed.
 - [ ] Documentation (README / API spec) is updated if the behaviour or the API changed.
 - [ ] Acceptance criteria of the linked user story are satisfied.
