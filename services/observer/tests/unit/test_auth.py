@@ -7,7 +7,8 @@ from fastapi import FastAPI
 
 from observer.auth import CurrentCurator, CurrentUser, NextcloudAuthenticator
 from observer.config import Settings
-from observer.problems import install_problem_handlers
+from observer.problems import Problem, install_problem_handlers
+from observer.resources import nextcloud_client
 from tests.conftest import NEXTCLOUD, FakeRedis, basic_auth
 
 USER_URL = f"{NEXTCLOUD}/ocs/v2.php/cloud/user"
@@ -120,3 +121,26 @@ async def test_curators(client: httpx.AsyncClient) -> None:
     response = await client.get("/curators-only", auth=("carol", "app-password"))
 
     assert response.status_code == 200
+
+
+@respx.mock
+async def test_nextcloud_session_cookies_are_not_sent_back(settings: Settings) -> None:
+    # Nextcloud answers a valid login with session cookies. Sent back, they
+    # would make it accept the next request whatever its credentials.
+    route = respx.get(USER_URL).mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json=ocs_user("alice", ["members"]),
+                headers={"Set-Cookie": "nc_session_id=abc; path=/; HttpOnly"},
+            ),
+            httpx.Response(401),
+        ]
+    )
+    async with nextcloud_client(settings) as nextcloud:
+        authenticator = NextcloudAuthenticator(nextcloud, FakeRedis(), cache_seconds=300)
+        await authenticator.authenticate("alice", "app-password")
+        with pytest.raises(Problem):
+            await authenticator.authenticate("alice", "wrong-password")
+
+    assert "Cookie" not in route.calls.last.request.headers
