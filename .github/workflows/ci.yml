@@ -30,6 +30,8 @@ env:
   UV_VERSION: "0.13.9"
   RUFF_VERSION: "0.17.6"
   HADOLINT_IMAGE: hadolint/hadolint:v2.15.1
+  # librarian's embedding model (src/librarian/config.py), the key of its cache.
+  EMBEDDING_MODEL: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 
 jobs:
   lint:
@@ -119,7 +121,19 @@ jobs:
       - name: Install the locked dependencies
         run: uv sync --locked
 
+      # librarian's relevance tests use the real embedding model (about 240 MB).
+      # fastembed downloads it the first time; later runs restore it from here.
+      - name: Restore the embedding model
+        if: matrix.service == 'librarian'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/fastembed
+          key: fastembed-${{ env.EMBEDDING_MODEL }}
+
       - name: Run the unit and integration tests
+        env:
+          # Only librarian uses it.
+          FASTEMBED_CACHE_PATH: ${{ runner.temp }}/fastembed
         run: uv run pytest
 
   build:
