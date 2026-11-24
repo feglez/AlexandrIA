@@ -35,4 +35,5 @@ def settings() -> Settings:
         redis_url="redis://localhost:6379/1",
         nextcloud_url=NEXTCLOUD,
         public_base_url="https://alexandria.test",
+        nextcloud_service_password="service-password",
     )

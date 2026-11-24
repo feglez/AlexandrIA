@@ -1,6 +1,7 @@
 """Clients shared by the whole process."""
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 
 import httpx
@@ -16,6 +17,7 @@ from librarian.auth import NextcloudAuthenticator
 from librarian.config import Settings
 from librarian.embeddings import Embedder
 from librarian.events import EventPublisher
+from librarian.library import LibraryFiles
 
 
 def nextcloud_client(settings: Settings) -> httpx.AsyncClient:
@@ -39,6 +41,10 @@ class Resources:
     authenticator: NextcloudAuthenticator
     embedder: Embedder
     events: EventPublisher
+    library: LibraryFiles
+    # Set when documents are queued, so the indexer does not wait for its
+    # next poll.
+    indexer_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
 
     @classmethod
     def from_settings(cls, settings: Settings, embedder: Embedder) -> "Resources":
@@ -55,6 +61,12 @@ class Resources:
             authenticator=NextcloudAuthenticator(nextcloud, redis, settings.auth_cache_seconds),
             embedder=embedder,
             events=EventPublisher(redis, settings.events_stream),
+            library=LibraryFiles(
+                nextcloud,
+                settings.nextcloud_service_user,
+                settings.nextcloud_service_password,
+                settings.library_folder,
+            ),
         )
 
     async def aclose(self) -> None:

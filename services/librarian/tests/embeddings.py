@@ -26,10 +26,13 @@ def vector(text: str) -> list[float]:
 class FakeEmbedder(Embedder):
     def __init__(self) -> None:
         self.queries: list[str] = []
+        # How many passages each call to passages() had.
+        self.batches: list[int] = []
 
     async def query(self, text: str) -> list[float]:
         self.queries.append(text)
         return vector(text)
 
     async def passages(self, texts: Sequence[str]) -> list[list[float]]:
+        self.batches.append(len(texts))
         return [vector(text) for text in texts]

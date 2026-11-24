@@ -2,21 +2,36 @@
 
 1. Apply the database migrations.
 2. Load the embedding model.
-3. Serve the API on PUBLIC_PORT. Scaling is done by running more containers.
+3. Serve the API on PUBLIC_PORT, and run the consumer of the domain events,
+   the indexer and the reconciliation with the library. Scaling is done by
+   running more containers.
 """
 
 import asyncio
+import contextlib
 import logging
+import signal
+from collections.abc import Iterator
 
 import uvicorn
 
 from librarian.app import create_public_app
 from librarian.config import Settings
+from librarian.consumer import EventConsumer
 from librarian.db.migrate import upgrade_database
 from librarian.embeddings import Embedder, FastEmbedEmbedder
+from librarian.indexer import Indexer
+from librarian.reconcile import Reconciler
 from librarian.resources import Resources
 
 logger = logging.getLogger("librarian")
+
+
+class _Server(uvicorn.Server):
+    # Signals are handled in serve(), so the tasks are stopped too.
+    @contextlib.contextmanager
+    def capture_signals(self) -> Iterator[None]:
+        yield
 
 
 class _SkipHealthChecks(logging.Filter):
@@ -26,7 +41,7 @@ class _SkipHealthChecks(logging.Filter):
 
 async def serve(settings: Settings, embedder: Embedder) -> None:
     resources = Resources.from_settings(settings, embedder)
-    server = uvicorn.Server(
+    server = _Server(
         uvicorn.Config(
             create_public_app(resources),
             host=settings.listen_host,
@@ -35,9 +50,26 @@ async def serve(settings: Settings, embedder: Embedder) -> None:
             proxy_headers=False,
         )
     )
+
+    def stop() -> None:
+        server.should_exit = True
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop)
+    tasks = [
+        asyncio.create_task(EventConsumer(resources).run(), name="consumer"),
+        asyncio.create_task(Indexer(resources).run(), name="indexer"),
+        asyncio.create_task(Reconciler(resources).run(), name="reconciler"),
+    ]
     try:
         await server.serve()
     finally:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         await resources.aclose()
 
 

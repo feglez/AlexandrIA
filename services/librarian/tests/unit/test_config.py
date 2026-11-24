@@ -7,6 +7,7 @@ def test_reads_environment_variables(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@db/librarian")
     monkeypatch.setenv("REDIS_URL", "redis://redis:6379/1")
     monkeypatch.setenv("PUBLIC_PORT", "9000")
+    monkeypatch.setenv("NEXTCLOUD_SERVICE_PASSWORD", "service-password")
 
     settings = Settings()
 
@@ -15,6 +16,9 @@ def test_reads_environment_variables(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.embedding_model.endswith("paraphrase-multilingual-MiniLM-L12-v2")
     assert settings.curators_group == "curators"
     assert settings.events_stream == "alexandria.events"
+    assert settings.events_group == "librarian"
+    assert settings.nextcloud_service_user == "alexandria"
+    assert settings.library_folder == "Library"
 
 
 def test_database_and_redis_are_required(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -22,4 +26,13 @@ def test_database_and_redis_are_required(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.delenv("REDIS_URL", raising=False)
 
     with pytest.raises(ValueError, match="database_url"):
+        Settings()
+
+
+def test_the_service_password_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@db/librarian")
+    monkeypatch.setenv("REDIS_URL", "redis://redis:6379/1")
+    monkeypatch.delenv("NEXTCLOUD_SERVICE_PASSWORD", raising=False)
+
+    with pytest.raises(ValueError, match="nextcloud_service_password"):
         Settings()
