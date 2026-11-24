@@ -8,7 +8,7 @@ from importlib.metadata import version
 
 from fastapi import FastAPI
 
-from observer.api import health
+from observer.api import health, usage
 from observer.problems import install_problem_handlers
 from observer.resources import Resources
 
@@ -18,6 +18,7 @@ def create_public_app(resources: Resources) -> FastAPI:
     app.state.resources = resources
     install_problem_handlers(app)
     app.include_router(health.router)
+    app.include_router(usage.router)
     return app
 
 

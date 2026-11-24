@@ -20,3 +20,15 @@ class Settings(BaseSettings):
     auth_cache_seconds: int = 300
     curators_group: str = "curators"
     log_level: str = "INFO"
+
+    # Account that reads the members' storage (sub-admin of the members group).
+    nextcloud_observer_user: str = "observer"
+    nextcloud_observer_password: str
+
+    # Redis stream of the domain events and observer's consumer group.
+    events_stream: str = "alexandria.events"
+    events_group: str = "observer"
+
+    # Contribution quota of every member.
+    default_max_contribution_bytes: int = 5 * 1024**3
+    default_max_submissions_per_month: int = 50
