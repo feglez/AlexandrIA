@@ -26,8 +26,16 @@ SERVICE="alexandria:${ALEXANDRIA_SERVICE_PASSWORD}"
 DAV="$NEXTCLOUD_URL/remote.php/dav/files"
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
 body="$work/body"
+json=(-H "Content-Type: application/json")
+# observer's container while the fail-safe step has it stopped: a failed run
+# starts it again, so the next run finds the whole stack.
+observer_stopped=
+cleanup() {
+    rm -rf "$work"
+    if [[ -n $observer_stopped ]]; then docker start "$observer_stopped" > /dev/null || true; fi
+}
+trap cleanup EXIT
 
 step() { printf '\n== %s\n' "$*"; }
 fail() {
@@ -49,8 +57,9 @@ field() { jq -er "$1" "$body"; }
 
 propfind() { expect 207 -X PROPFIND -H "Depth: 1" "$@"; }
 
-# query SQL: run a query in watchman's database, print the result.
-query() { docker compose exec -T postgres psql -U postgres -d watchman -tAc "$1"; }
+# query SQL [DATABASE]: run a query in watchman's database (or another one),
+# print the result.
+query() { docker compose exec -T postgres psql -U postgres -d "${2:-watchman}" -tAc "$1"; }
 
 # decide ID approve|reject CURL_ARGS...: a curator decision on a submission.
 decide() {
@@ -61,6 +70,19 @@ decide() {
 
 # history: the status history of the submission in $body, as "from>to:actor ...".
 history() { field '[.history[] | "\(.from_status)>\(.to_status):\(.actor)"] | join(" ")'; }
+
+# moved ID: wait until the mover has published the submission. Removing the
+# empty quarantine folder is the last thing it does.
+moved() {
+    local code
+    for _ in $(seq 30); do
+        code=$(curl -sS -o /dev/null -w '%{http_code}' -X PROPFIND -H "Depth: 0" -u "$SERVICE" \
+            "$DAV/alexandria/Quarantine/$1")
+        [[ $code == 404 ]] && return
+        sleep 1
+    done
+    fail "Quarantine/$1 is still there after 30 s"
+}
 
 # notified CREDENTIALS SUBJECT: print the message of the member's Nextcloud
 # notification with this subject.
@@ -92,11 +114,45 @@ drained() {
 # usage CREDENTIALS: the member's usage from observer, in $body.
 usage() { expect 200 -u "$1" "$OBSERVER_URL/api/v1/usage/me"; }
 
+# quota CREDENTIALS MEMBER JSON: set the member's quota.
+quota() { expect 200 -u "$1" -X PUT "${json[@]}" -d "$3" "$OBSERVER_URL/api/v1/quotas/$2"; }
+
+# observer_up: start observer's container again and wait until it answers.
+# Only the container: "docker compose start" would run bootstrap again.
+observer_up() {
+    docker start "$observer_stopped" > /dev/null
+    for _ in $(seq 60); do
+        if curl -fsS -o /dev/null "$OBSERVER_URL/healthz" 2> /dev/null; then
+            observer_stopped=
+            return
+        fi
+        sleep 1
+    done
+    fail "observer does not answer 60 s after it started"
+}
+
 run_id="$(date -u +%Y%m%d%H%M%S)-$RANDOM$RANDOM"
+# Every run adds files and submissions for alice and bob, so they get a quota
+# larger than the default one: the test can run many times on the same volumes.
+QUOTA='{"max_contribution_bytes": 10737418240, "max_submissions_per_month": 1000}'
 
 step "watchman lists the library collections"
 expect 200 -u "$ALICE" "$WATCHMAN_URL/api/v1/collections"
 field '.items[].name' | grep -qx Manuals || fail "Manuals is not a collection"
+
+step "carol gives alice and bob a quota of their own"
+for member in alice bob; do
+    quota "$CAROL" "$member" "$QUOTA"
+    [[ $(field .updated_by) == carol ]] || fail "updated_by is not carol"
+done
+
+step "Members can read their own quota, but not set it"
+expect 200 -u "$ALICE" "$OBSERVER_URL/api/v1/quotas/alice"
+[[ $(field .max_submissions_per_month) == 1000 ]] || fail "alice's quota is not the new one"
+expect 403 -u "$ALICE" "$OBSERVER_URL/api/v1/quotas/bob"
+expect 403 -u "$ALICE" -X PUT "${json[@]}" -d "$QUOTA" "$OBSERVER_URL/api/v1/quotas/alice"
+expect 422 -u "$CAROL" -X PUT "${json[@]}" -d '{"max_contribution_bytes": -1}' \
+    "$OBSERVER_URL/api/v1/quotas/alice"
 
 # Earlier runs on the same volumes count too: the checks below compare with
 # these figures.
@@ -105,6 +161,9 @@ drained
 usage "$ALICE"
 [[ $(field .user) == alice ]] || fail "user is not alice"
 [[ $(field .period) == "$(date -u +%Y-%m)" ]] || fail "period is not this month"
+[[ $(field .submissions.limit) == 1000 ]] || fail "the submission limit is not alice's quota"
+[[ $(field .library_contribution.quota_bytes) == 10737418240 ]] ||
+    fail "the contribution quota is not alice's quota"
 contributed=$(field .library_contribution.used_bytes)
 submitted=$(field .submissions.this_period)
 storage=$(field .personal_storage.used_bytes)
@@ -122,9 +181,8 @@ id=$(field .id)
 echo "submission $id"
 [[ $(field .status) == pending_review ]] || fail "status is not pending_review"
 [[ $(field .mime_type) == text/markdown ]] || fail "wrong MIME type"
-# observer serves no quota check yet: the check is unavailable (fail-safe).
-[[ $(field '.checks[] | select(.name == "quota") | .result') == unavailable ]] ||
-    fail "the quota check should be unavailable"
+[[ $(field '.checks[] | select(.name == "quota") | .result') == pass ]] ||
+    fail "the quota check did not pass"
 
 step "The file is in quarantine"
 propfind -u "$SERVICE" "$DAV/alexandria/Quarantine/$id"
@@ -168,16 +226,9 @@ step "carol approves it"
 decide "$id" approve 200 -u "$CAROL"
 [[ $(field .status) == approved ]] || fail "status is not approved"
 
-# The mover publishes it in the background; removing the empty quarantine
-# folder is the last thing it does.
+# The mover publishes it in the background.
 step "watchman publishes it"
-for _ in $(seq 30); do
-    code=$(curl -sS -o /dev/null -w '%{http_code}' -X PROPFIND -H "Depth: 0" -u "$SERVICE" \
-        "$DAV/alexandria/Quarantine/$id")
-    [[ $code == 404 ]] && break
-    sleep 1
-done
-[[ $code == 404 ]] || fail "Quarantine/$id is still there after 30 s"
+moved "$id"
 
 step "alice sees the file in the library"
 propfind -u "$ALICE" "$DAV/alice/Library/Manuals"
@@ -222,7 +273,6 @@ printf 'To be rejected, run %s.\n' "$run_id" > "$work/$other"
 expect 202 -u "$ALICE" -F "file=@$work/$other" -F collection=Manuals \
     "$WATCHMAN_URL/api/v1/submissions"
 rejected=$(field .id)
-json=(-H "Content-Type: application/json")
 decide "$rejected" reject 422 -u "$CAROL" "${json[@]}" -d '{"reason": " "}'
 decide "$rejected" reject 200 -u "$CAROL" "${json[@]}" -d '{"reason": "Smoke test"}'
 [[ $(field .status) == rejected ]] || fail "status is not rejected"
@@ -290,20 +340,45 @@ step "bob is in the trusted group"
 expect 200 -u "$BOB" -H "OCS-APIRequest: true" "$NEXTCLOUD_URL/ocs/v2.php/cloud/user?format=json"
 field '.ocs.data.groups[]' | grep -qx trusted || fail "bob is not in the trusted group"
 
-# observer serves no quota check yet, so the quota check is unavailable and
-# the auto-approve rule must not apply (fail-safe).
-step "bob is trusted, but without the quota check the file waits for a curator"
+step "bob is trusted, so a file from bob is published without a curator"
 trusted="smoke-$run_id-trusted.txt"
 printf 'From a trusted member, run %s.\n' "$run_id" > "$work/$trusted"
 expect 202 -u "$BOB" -F "file=@$work/$trusted" -F collection=Manuals \
     "$WATCHMAN_URL/api/v1/submissions"
+auto=$(field .id)
+[[ $(field .status) == approved ]] || fail "status is not approved"
+[[ $(field '.checks[] | select(.name == "quota") | .result') == pass ]] ||
+    fail "the quota check did not pass"
+moved "$auto"
+expect 200 -u "$BOB" "$WATCHMAN_URL/api/v1/submissions/$auto"
+[[ $(field .status) == published ]] || fail "status is not published"
+[[ $(history) == "checking>approved:watchman approved>published:watchman" ]] ||
+    fail "history: '$(history)'"
+[[ $(field '.history[0].reason') == auto_approve ]] || fail "the reason is not auto_approve"
+stored=$(query "SELECT policy_version FROM submissions WHERE id = '$auto'")
+[[ $stored == "$new_version" ]] || fail "policy version: '$stored'"
+propfind -u "$BOB" "$DAV/bob/Library/Manuals"
+grep -q "$trusted" "$body" || fail "$trusted is not in bob's Library/Manuals"
+message=$(notified "$BOB" "Your file $trusted is in the library")
+[[ $message == "It was approved automatically, and it is now at Library/Manuals/$trusted." ]] ||
+    fail "notification: '$message'"
+
+# watchman does not depend on observer: if the quota check gets no answer, the
+# file waits for a curator, even from a trusted member (fail-safe).
+step "While observer is down, bob's next file waits for a curator"
+observer_stopped=$(docker compose ps -q observer)
+docker stop "$observer_stopped" > /dev/null
+waiting="smoke-$run_id-waiting.txt"
+printf 'Submitted while observer is down, run %s.\n' "$run_id" > "$work/$waiting"
+expect 202 -u "$BOB" -F "file=@$work/$waiting" -F collection=Manuals \
+    "$WATCHMAN_URL/api/v1/submissions"
 [[ $(field .status) == pending_review ]] || fail "status is not pending_review"
 [[ $(field '.checks[] | select(.name == "quota") | .result') == unavailable ]] ||
     fail "the quota check should be unavailable"
-stored=$(query "SELECT s.policy_version || ' ' || h.to_status || ':' || h.actor
-                FROM submissions s JOIN status_history h ON h.submission_id = s.id
-                WHERE s.id = '$(field .id)'")
-[[ $stored == "$new_version pending_review:bob" ]] || fail "database: '$stored'"
+waiting_id=$(field .id)
+observer_up
+# Withdrawn, so pending submissions do not pile up over many runs.
+expect 204 -u "$BOB" -X DELETE "$WATCHMAN_URL/api/v1/submissions/$waiting_id"
 
 step "A file whose content does not match its extension is rejected"
 printf 'Not a PDF, run %s.\n' "$run_id" > "$work/fake.pdf"
@@ -323,6 +398,44 @@ usage "$ALICE"
 step "Members cannot see the usage of others"
 expect 403 -u "$BOB" "$OBSERVER_URL/api/v1/usage"
 expect 401 "$OBSERVER_URL/api/v1/usage/me"
+
+# carol submits nothing else, so this quota does not get in the way of the
+# other steps if a run stops half-way.
+step "carol gets a quota of 0 submissions, and the next file from carol is rejected"
+quota "$CAROL" carol '{"max_contribution_bytes": 10737418240, "max_submissions_per_month": 0}'
+over="smoke-$run_id-over-quota.txt"
+printf 'Over the quota, run %s.\n' "$run_id" > "$work/$over"
+expect 422 -u "$CAROL" -F "file=@$work/$over" -F collection=Manuals \
+    "$WATCHMAN_URL/api/v1/submissions"
+[[ $(field .reason) == quota_exceeded ]] || fail "reason is not quota_exceeded"
+[[ $(field '.checks[] | select(.name == "quota") | .detail') == *" and 0 submissions left this month." ]] ||
+    fail "the quota check does not say what is left"
+quota "$CAROL" carol "$QUOTA"
+
+step "observer's quota check is not reachable from outside"
+expect 404 -X POST "${json[@]}" -d '{"user": "alice", "size_bytes": 1}' \
+    "$OBSERVER_URL/internal/quota-checks"
+docker inspect -f '{{json .HostConfig.PortBindings}}' "$(docker compose ps -q observer)" |
+    jq -e 'has("8000/tcp") and (has("8001/tcp") | not)' > /dev/null ||
+    fail "observer's internal port is published"
+
+step "observer keeps snapshots of the members' storage"
+stored=$(query "SELECT used_bytes FROM storage_snapshots WHERE member = 'alice'
+                ORDER BY taken_at DESC LIMIT 1" observer)
+[[ $stored == "$storage" ]] || fail "snapshot of alice: '$stored' bytes, Nextcloud says $storage"
+
+step "carol gets the cost-split report of last month"
+last_month=$(date -u -d "$(date -u +%Y-%m-15) -1 month" +%Y-%m)
+expect 200 -u "$CAROL" "$OBSERVER_URL/api/v1/reports/$last_month"
+[[ $(field .period) == "$last_month" ]] || fail "period is not $last_month"
+[[ $(field .split_rule) == proportional_to_storage ]] || fail "wrong split rule"
+jq -e --argjson cost "${MONTHLY_COST_EUR:-5.40}" '.monthly_cost_eur == $cost' "$body" > /dev/null ||
+    fail "the monthly cost is not ${MONTHLY_COST_EUR:-5.40}"
+jq -e '(.members | length) == 0 or
+    ((.members | map(.amount_eur) | add) * 100 | round) == (.monthly_cost_eur * 100 | round)' \
+    "$body" > /dev/null || fail "the amounts do not add up to the monthly cost"
+expect 409 -u "$CAROL" "$OBSERVER_URL/api/v1/reports/$(date -u +%Y-%m)"
+expect 403 -u "$ALICE" "$OBSERVER_URL/api/v1/reports/$last_month"
 
 step "carol sees the usage of every member"
 expect 200 -u "$CAROL" "$OBSERVER_URL/api/v1/usage?limit=100"

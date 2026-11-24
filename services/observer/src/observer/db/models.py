@@ -52,3 +52,33 @@ class UsageTotal(Base):
     submissions: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     searches: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     questions: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+
+
+class Quota(Base):
+    """A member's own contribution quota, set by a curator.
+
+    A member without a row has the default quota from the settings.
+    """
+
+    __tablename__ = "quotas"
+
+    member: Mapped[str] = mapped_column(Text, primary_key=True)
+    max_contribution_bytes: Mapped[int] = mapped_column(BigInteger)
+    max_submissions_per_month: Mapped[int] = mapped_column(Integer)
+    updated_by: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()")
+    )
+
+
+class StorageSnapshot(Base):
+    """A member's personal storage in Nextcloud at one moment.
+
+    The monthly report uses the last snapshot taken before the end of the month.
+    """
+
+    __tablename__ = "storage_snapshots"
+
+    member: Mapped[str] = mapped_column(Text, primary_key=True)
+    taken_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    used_bytes: Mapped[int] = mapped_column(BigInteger)

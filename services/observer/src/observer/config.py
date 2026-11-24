@@ -1,5 +1,8 @@
 """Settings read from environment variables."""
 
+from decimal import Decimal
+
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,6 +32,19 @@ class Settings(BaseSettings):
     events_stream: str = "alexandria.events"
     events_group: str = "observer"
 
-    # Contribution quota of every member.
+    # Token that watchman sends with the quota check on the internal port.
+    observer_internal_token: str
+
+    # Contribution quota of a member who has no quota of their own.
     default_max_contribution_bytes: int = 5 * 1024**3
     default_max_submissions_per_month: int = 50
+
+    # The members' personal storage is recorded at start-up and then every
+    # storage_snapshot_seconds, for the monthly report. If the members group
+    # cannot be read, it is tried again after storage_snapshot_retry_seconds.
+    members_group: str = "members"
+    storage_snapshot_seconds: float = 24 * 3600
+    storage_snapshot_retry_seconds: float = 60
+
+    # Running cost of the platform in euros a month, split among the members.
+    monthly_cost_eur: Decimal = Field(default=Decimal("5.40"), ge=0, decimal_places=2)

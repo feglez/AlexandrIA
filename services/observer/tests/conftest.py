@@ -36,4 +36,5 @@ def settings() -> Settings:
         nextcloud_url=NEXTCLOUD,
         public_base_url="https://alexandria.test",
         nextcloud_observer_password="observer-password",
+        observer_internal_token="observer-token",
     )

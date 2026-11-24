@@ -233,7 +233,7 @@ flowchart TB
 | watchman | Python, FastAPI | Submission workflow, automatic checks, moderation policies, curator decisions; single entry point for Nextcloud file-event webhooks, which it republishes as domain events | `watchman` DB (submissions, history, policies) |
 | librarian | Python, FastAPI, [fastembed](https://github.com/qdrant/fastembed) (ONNX Runtime) with `paraphrase-multilingual-MiniLM-L12-v2` (384 dimensions, multilingual because household documents are mostly in Spanish) | RAG: text extraction, chunking, embeddings, retrieval, answer generation through the LLM runtime (one question at a time, from a queue), semantic search, index maintenance | `librarian` DB (documents, chunks, vectors via pgvector, questions and answers) |
 | LLM runtime | [Ollama](https://ollama.com) (arm64) with a small multilingual instruct model (about 0.5-1.5B parameters, quantised, for example Qwen2.5 1.5B Instruct) | Generates answers from the passages retrieved by librarian; only reachable from librarian | Model files on the SSD volume |
-| observer | Python, FastAPI | Usage ledger, quotas, monthly cost-split reports | `observer` DB (usage events, aggregates, quotas) |
+| observer | Python, FastAPI | Usage ledger, quotas, monthly cost-split reports | `observer` DB (usage events, aggregates, quotas, storage snapshots) |
 | PostgreSQL + pgvector | `pgvector/pgvector` image (pinned tag, e.g. `pg17`) | Relational persistence and vector similarity search; one database and one role per service | Volume on the SSD |
 | Redis | Official image | Nextcloud cache and file locking; event stream between services; question queue; short-lived auth cache | In memory (with persistence for the stream) |
 | Tailscale operator and ingress proxy | Tailscale Kubernetes operator (replaces the Traefik ingress that K3s installs by default) | Public HTTPS entry point through Funnel, TLS termination inside the cluster and path routing to Nextcloud or to each service; `/internal/*` is never exposed | — |
@@ -363,7 +363,7 @@ The platform runs on a **Raspberry Pi 4 Model B (8 GB)** with a **USB SSD** for 
   ```
 
 - **Pagination:** `limit` (default 20, max 100) and `offset`; list responses are `{ "items": [...], "total": n, "limit": l, "offset": o }`.
-- **Common status codes:** `401` invalid credentials, `403` insufficient role, `404` not found, `409` invalid state transition, `422` validation or failed check.
+- **Common status codes:** `401` invalid credentials, `403` insufficient role, `404` not found, `409` invalid state transition (or a report of a month that is not over), `422` validation or failed check.
 
 ### 5.2 watchman - curation workflow
 
@@ -398,7 +398,7 @@ The platform runs on a **Raspberry Pi 4 Model B (8 GB)** with a **USB SSD** for 
     { "name": "mime_consistency", "result": "pass" },
     { "name": "blocked_type", "result": "pass" },
     { "name": "duplicate", "result": "pass" },
-    { "name": "quota", "result": "pass", "detail": "1.2 GB of 5 GB used" }
+    { "name": "quota", "result": "pass", "detail": "4.1 GB and 35 submissions left this month." }
   ],
   "created_at": "2026-10-19T17:42:10Z"
 }
@@ -556,7 +556,7 @@ Each `PUT` stores a new version with the curator who saved it, and the latest ve
 }
 ```
 
-`period` is the current month (UTC). `personal_storage` comes from Nextcloud (`/cloud/users/{user}`, read with the `observer` account): `quota_bytes` is `null` when the member has no limit in Nextcloud, and `personal_storage` is `null` when Nextcloud does not answer. `library_contribution.used_bytes` is the size of the member's files in the library (published minus removed), and the other figures count the events of this month (4.3); they follow the events within seconds. The quotas are the default ones: 5 GiB of contributions and 50 submissions a month (settings `DEFAULT_MAX_CONTRIBUTION_BYTES` and `DEFAULT_MAX_SUBMISSIONS_PER_MONTH`).
+`period` is the current month (UTC). `personal_storage` comes from Nextcloud (`/cloud/users/{user}`, read with the `observer` account): `quota_bytes` is `null` when the member has no limit in Nextcloud, and `personal_storage` is `null` when Nextcloud does not answer. `library_contribution.used_bytes` is the size of the member's files in the library (published minus removed), and the other figures count the events of this month (4.3); they follow the events within seconds. `library_contribution.quota_bytes` and `submissions.limit` are the member's quota (`GET /quotas/{user}` below).
 
 `GET /usage?period=2026-10` → `200 OK`: the list format of section 5.1 plus the `period`, with one item for each member who has any usage up to that month, ordered by user name. Each item is like the `GET /usage/me` answer without `period` and `personal_storage`, and its `library_contribution.used_bytes` is the contribution at the end of the month.
 
@@ -578,11 +578,21 @@ Each `PUT` stores a new version with the curator who saved it, and the latest ve
 }
 ```
 
+`GET /quotas/alice` → `200 OK`
+
+```json
+{ "user": "alice", "max_contribution_bytes": 5368709120, "max_submissions_per_month": 50, "updated_by": null, "updated_at": null }
+```
+
+A member without a quota of their own has the default one: 5 GiB of contributions and 50 submissions a month (settings `DEFAULT_MAX_CONTRIBUTION_BYTES` and `DEFAULT_MAX_SUBMISSIONS_PER_MONTH`), and then `updated_by` and `updated_at` are `null`. Members can read their own quota and curators everybody's; anyone else gets `403`.
+
 `PUT /quotas/alice` - request:
 
 ```json
 { "max_contribution_bytes": 5368709120, "max_submissions_per_month": 50 }
 ```
+
+Only curators can set a quota (`403` for members). Both fields are required and must be 0 or more; anything else, an unknown field included, gets `422`. The answer is the stored quota, as in `GET`, with the curator in `updated_by`. It applies from the next submission on.
 
 `POST /internal/quota-checks` - request `{ "user": "alice", "size_bytes": 482133 }` → `200 OK`
 
@@ -590,19 +600,23 @@ Each `PUT` stores a new version with the curator who saved it, and the latest ve
 { "allowed": true, "remaining_bytes": 4079736799, "remaining_submissions": 35 }
 ```
 
+A submission is allowed when the member's contribution (published minus removed, over every month) plus `size_bytes` fits in `max_contribution_bytes`, and their accepted submissions this month plus this one fit in `max_submissions_per_month`. The remaining figures are what the member has left once this submission is accepted or, when it is not allowed, what they have left now, never below 0. With alice's usage above and the default quota: 5368709120 - 1288490188 - 482133 bytes and 50 - 14 - 1 submissions. watchman shows them in the detail of its `quota` check (5.2). The endpoint is only served on observer's internal port (8001), which is not published, and it needs `OBSERVER_INTERNAL_TOKEN` as a bearer token (`401` without it). This example is also in [`contracts/quota-check.json`](contracts/quota-check.json), and the tests of both services check their side against it.
+
 `GET /reports/2026-10` → `200 OK`
 
 ```json
 {
   "period": "2026-10",
-  "monthly_cost_eur": 5.40,
+  "monthly_cost_eur": 5.4,
   "split_rule": "proportional_to_storage",
   "members": [
-    { "user": "alice", "storage_bytes": 9609989324, "share": 0.46, "amount_eur": 2.48, "submissions": 14, "searches": 230, "questions": 12 },
-    { "user": "bob",   "storage_bytes": 11281069056, "share": 0.54, "amount_eur": 2.92, "submissions": 3,  "searches": 41, "questions": 5 }
+    { "user": "alice", "storage_bytes": 9609989324, "contributed_bytes": 1288490188, "share": 0.46, "amount_eur": 2.48, "submissions": 14, "searches": 230, "questions": 12 },
+    { "user": "bob", "storage_bytes": 11281069056, "contributed_bytes": 734003200, "share": 0.54, "amount_eur": 2.92, "submissions": 3, "searches": 41, "questions": 5 }
   ]
 }
 ```
+
+Only months that are over (UTC) have a report: the current month or a later one gets `409`. The report lists, by user name, every member with usage up to the end of the month or with a storage snapshot taken before it. observer takes a snapshot of the personal storage of every member of the `members` group (`/cloud/users/{user}`) when it starts and then once a day. A member's `storage_bytes` is their personal storage in the last snapshot taken before the month ended (0 without one) plus `contributed_bytes`, their contribution to the library at the end of the month. The monthly cost comes from the setting `MONTHLY_COST_EUR` (5.40 by default, as in 3.1). Each member's `share` is their part of the total storage (four decimal places), and `amount_eur` is the cost times that share, rounded to cents; the difference that rounding leaves goes to the member with the largest storage, so the amounts add up to the cost exactly. If nobody stores anything, the cost is split equally. `submissions`, `searches` and `questions` count the events of that month (4.3).
 
 ---
 
@@ -653,7 +667,7 @@ The Nextcloud web interface is at <http://localhost:8080>, and the services at `
 | `librarian` | built from `services/librarian` | frontend, backend | `127.0.0.1:8082` | RAG and semantic search |
 | `observer` | built from `services/observer` | frontend, backend | `127.0.0.1:8083` | Usage, quotas and reports |
 
-**Start order and health checks.** Every long-running container has a health check: `pg_isready`, `redis-cli ping`, Nextcloud's `status.php` reporting `"installed":true`, the cron daemon, `ollama list`, and for our services a request to `/healthz` made with Python (the slim images have no curl). `depends_on` with `service_healthy` and `service_completed_successfully` starts PostgreSQL and Redis first, then Nextcloud, and then `bootstrap` and the services (watchman waits until `bootstrap` has finished). Each service applies its database migrations when it starts, under a PostgreSQL advisory lock so that several replicas can start at the same time.
+**Start order and health checks.** Every long-running container has a health check: `pg_isready`, `redis-cli ping`, Nextcloud's `status.php` reporting `"installed":true`, the cron daemon, `ollama list`, and for our services a request to `/healthz` made with Python (the slim images have no curl). `depends_on` with `service_healthy` and `service_completed_successfully` starts PostgreSQL and Redis first, then Nextcloud, and then `bootstrap` and the services (watchman and observer wait until `bootstrap` has finished). Each service applies its database migrations when it starts, under a PostgreSQL advisory lock so that several replicas can start at the same time.
 
 **Ports.** Only container port 8000 (public API) of each service is published. watchman and observer also listen on port 8001 for their internal endpoints (`/internal/*`, section 5), which is never published.
 
@@ -687,6 +701,7 @@ Every setting comes from `.env`, a copy of [`.env.example`](.env.example). It on
 - `IMAGE_TAG=dev` makes compose build the service images locally and tag them `ghcr.io/feglez/alexandria-<service>:dev`.
 - `OLLAMA_MODEL` (default `qwen2.5:1.5b`) and `LIBRARY_COLLECTIONS` (the top-level folders of the library).
 - `OBSERVER_INTERNAL_TOKEN`: the token watchman sends with observer's internal quota check (5.4).
+- `MONTHLY_COST_EUR` (default 5.40): the running cost of the platform each month, which observer's report splits among the members (5.4).
 
 Accounts created on the first start, with the passwords from `.env`:
 
@@ -811,7 +826,7 @@ A new push to a pull request cancels the run that was in progress for it. Runs o
 | `lint` | `ruff check` and `ruff format --check` on `services/`, hadolint on the three Dockerfiles, and `docker compose config` with a copy of `.env.example` |
 | `test` | One job per service. It installs the locked dependencies with `uv sync --locked` and runs the unit and integration tests with pytest. PostgreSQL with pgvector and Redis run as service containers, from the same images as in `compose.yaml`. Nextcloud is mocked |
 | `build` | One job per service and architecture. It builds the image for `linux/amd64` on an x64 runner and for `linux/arm64` on an Arm runner, with a layer cache per service and architecture. On `main` and on tags it also pushes the image to GHCR by digest, without a tag |
-| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): files are submitted through watchman, a curator approves one (it must appear in the library) and rejects another, the member follows both and gets a Nextcloud notification for each, withdraws a third one, a curator reads the moderation policy and saves it as a new version, observer adds the published file and the accepted submissions to the member's usage, only a curator sees everyone's usage, and each result is checked in Nextcloud, PostgreSQL and Redis |
+| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): a curator sets the members' quotas, files are submitted through watchman, a curator approves one (it must appear in the library) and rejects another, the member follows both and gets a Nextcloud notification for each, withdraws a third one, a curator reads the moderation policy and saves it as a new version, a trusted member's file is published without a curator, and while observer is stopped the next one waits for a curator, observer adds the published file and the accepted submissions to the member's usage, only a curator sees everyone's usage, a file over the submitter's quota is rejected, observer's internal port is not published, and a curator gets last month's cost-split report. Each result is checked in Nextcloud, PostgreSQL and Redis |
 | `publish` | Only on `main` and on tags, once the four jobs above have passed. One job per service: it joins the two images pushed by `build` into one multi-arch image and gives it its tags (9.3) |
 | `ci-ok` | Fails unless every other job succeeded (`publish` is skipped on pull requests). It is the only status check that the `main` ruleset requires, so the ruleset does not depend on the names of the matrix jobs |
 

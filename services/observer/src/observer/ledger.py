@@ -23,8 +23,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import AwareDatetime, BaseModel, Field
+from sqlalchemy import ColumnElement, Select, case, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import InstrumentedAttribute
 
 from observer.db.models import UsageEvent, UsageTotal
 
@@ -128,3 +130,24 @@ async def record(session: AsyncSession, entry: Entry) -> bool:
         )
     )
     return True
+
+
+def _sum_in(period: str, column: InstrumentedAttribute[int]) -> ColumnElement[int]:
+    return func.sum(case((UsageTotal.period == period, column), else_=0))
+
+
+def totals(period: str) -> Select:
+    """One row per member with usage up to the end of the period: the
+    contribution up to then, and the submissions, searches and questions of
+    the period. PostgreSQL gives the sums as numeric."""
+    return (
+        select(
+            UsageTotal.member,
+            func.sum(UsageTotal.contributed_bytes).label("contributed_bytes"),
+            _sum_in(period, UsageTotal.submissions).label("submissions"),
+            _sum_in(period, UsageTotal.searches).label("searches"),
+            _sum_in(period, UsageTotal.questions).label("questions"),
+        )
+        .where(UsageTotal.period <= period)
+        .group_by(UsageTotal.member)
+    )

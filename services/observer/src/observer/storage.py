@@ -5,6 +5,9 @@ of the members group, so it can read the members' details and nothing else.
 The answer has `quota.used` (bytes in the member's files) and `quota.quota`
 (the limit in bytes, -3 when the member has no limit). The client also takes
 "none" for no limit, and sizes given as floats.
+
+`GET /ocs/v2.php/cloud/groups/{group}/users` lists the members, which a
+sub-admin of that group may read too.
 """
 
 import logging
@@ -65,3 +68,28 @@ class NextcloudStorage:
             logger.warning("Cannot read the storage of %s: unexpected quota %r", member, quota)
             return None
         return Storage(used_bytes=used, quota_bytes=limit)
+
+    async def members(self, group: str) -> list[str] | None:
+        """The user names in the group, or None if Nextcloud does not tell."""
+        try:
+            response = await self._client.get(
+                f"/ocs/v2.php/cloud/groups/{quote(group, safe='')}/users",
+                params={"format": "json"},
+                auth=self._auth,
+                headers={"OCS-APIRequest": "true"},
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("Cannot list the members of %s: %r", group, exc)
+            return None
+        if response.status_code != 200:
+            logger.warning("Cannot list the members of %s: HTTP %s", group, response.status_code)
+            return None
+        try:
+            users = response.json()["ocs"]["data"]["users"]
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.warning("Cannot list the members of %s: unexpected answer %r", group, exc)
+            return None
+        if not isinstance(users, list) or not all(isinstance(u, str) and u for u in users):
+            logger.warning("Cannot list the members of %s: unexpected users %r", group, users)
+            return None
+        return users
