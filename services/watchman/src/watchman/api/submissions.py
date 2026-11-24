@@ -88,8 +88,9 @@ class SubmissionOut(BaseModel):
     },
 )
 async def submit(
-    request: Request, user: CurrentUser, session: DbSession, policy: ActivePolicy
+    request: Request, user: CurrentUser, session: DbSession, active: ActivePolicy
 ) -> SubmissionOut:
+    policy = active.policy
     _check_length(request, policy)
     resources: Resources = request.app.state.resources
     async with request.form(max_files=1, max_fields=4) as form:
@@ -115,6 +116,7 @@ async def submit(
             mime_type=facts.mime_type,
             sha256=facts.sha256,
             submitted_by=user.id,
+            policy_version=active.version,
         )
         existing_path = await session.scalar(
             select(LibraryFile.path).where(LibraryFile.sha256 == facts.sha256).limit(1)

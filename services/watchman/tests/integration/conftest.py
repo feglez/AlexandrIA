@@ -26,6 +26,7 @@ from watchman.app import create_public_app
 from watchman.config import Settings
 from watchman.db.migrate import upgrade_database
 from watchman.db.models import Submission
+from watchman.policy import DEFAULT_POLICY, Policy, save
 from watchman.resources import Resources
 
 TEST_DATABASE = "test_watchman"
@@ -75,14 +76,20 @@ DAV_PATH = "/remote.php/dav/files/alexandria"
 ALICE = ("alice", "alice-app-password")
 BOB = ("bob", "bob-app-password")
 CAROL = ("carol", "carol-app-password")
-GROUPS = {"alice": ["members"], "bob": ["members"], "carol": ["members", "curators"]}
+DAVE = ("dave", "dave-app-password")
+GROUPS = {
+    "alice": ["members"],
+    "bob": ["members"],
+    "carol": ["members", "curators"],
+    "dave": ["members", "trusted"],
+}
 ALLOWED = {"allowed": True, "remaining_bytes": 4_079_736_799, "remaining_submissions": 35}
 # Nextcloud file id of every quarantined file in the mocks.
 FILE_ID = 4182
 
 
 def nextcloud_user(request: httpx.Request) -> httpx.Response:
-    for user, password in (ALICE, BOB, CAROL):
+    for user, password in (ALICE, BOB, CAROL, DAVE):
         if request.headers.get("Authorization") == basic_auth(user, password):
             data = {"id": user, "displayname": user.title(), "groups": GROUPS[user]}
             return httpx.Response(200, json={"ocs": {"meta": {"statuscode": 200}, "data": data}})
@@ -104,6 +111,8 @@ async def resources(migrated_database_url: str, redis_url: str) -> AsyncIterator
     resources = Resources.from_settings(settings)
     async with resources.engine.begin() as connection:
         await connection.execute(text("TRUNCATE submissions, status_history, library_files"))
+        # Keep only the policy stored by the migration.
+        await connection.execute(text("DELETE FROM policies WHERE version > 1"))
     yield resources
     await resources.redis.delete(settings.events_stream)
     await resources.aclose()
@@ -162,6 +171,13 @@ async def submit(
         data={"collection": collection, **data},
         auth=auth,
     )
+
+
+async def use_policy(resources: Resources, **changes: object) -> int:
+    """Store a new active policy: the default one with some fields replaced."""
+    policy = Policy.model_validate(DEFAULT_POLICY.model_dump() | changes)
+    async with resources.sessions() as session:
+        return (await save(session, policy, "carol")).version
 
 
 async def stored(resources: Resources) -> list[Submission]:

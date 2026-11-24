@@ -7,15 +7,24 @@ import json
 import httpx
 import pytest
 import respx
-from fastapi import FastAPI
 from sqlalchemy import func, select
 
 from tests import samples
 from tests.conftest import basic_auth
-from tests.integration.conftest import ALICE, ALLOWED, DAV_PATH, events, stored, submit
+from tests.integration.conftest import (
+    ALICE,
+    ALLOWED,
+    DAV_PATH,
+    events,
+    stored,
+    submit,
+    use_policy,
+)
 from watchman.db.models import LibraryFile, StatusChange, Submission
-from watchman.policy import Policy, active_policy
 from watchman.resources import Resources
+
+# A policy with a size limit of 50 bytes.
+TINY_LIMIT = {"max_size_bytes": 50, "auto_approve": {"groups": ["trusted"], "max_size_bytes": 50}}
 
 
 async def test_accepted_submission(
@@ -55,6 +64,7 @@ async def test_accepted_submission(
     [submission] = await stored(resources)
     assert submission.status == "pending_review"
     assert submission.quarantine_path == f"Quarantine/{body['id']}/warranty.pdf"
+    assert submission.policy_version == 1
     async with resources.sessions() as session:
         [change] = await session.scalars(select(StatusChange))
     assert (change.from_status, change.to_status, change.actor) == (
@@ -114,9 +124,9 @@ async def rejected(
 
 
 async def test_file_over_the_size_limit(
-    app: FastAPI, client: httpx.AsyncClient, resources: Resources, mocked: respx.MockRouter
+    client: httpx.AsyncClient, resources: Resources, mocked: respx.MockRouter
 ) -> None:
-    app.dependency_overrides[active_policy] = lambda: Policy(max_size_bytes=50)
+    version = await use_policy(resources, **TINY_LIMIT)
 
     body = await rejected(await submit(client), resources, mocked, "file_too_large")
 
@@ -126,12 +136,14 @@ async def test_file_over_the_size_limit(
     assert checks["size_limit"] == "fail"
     assert checks["quota"] == "skipped"
     assert not mocked["quota"].called
+    [submission] = await stored(resources)
+    assert submission.policy_version == version
 
 
 async def test_request_far_over_the_size_limit(
-    app: FastAPI, client: httpx.AsyncClient, resources: Resources, mocked: respx.MockRouter
+    client: httpx.AsyncClient, resources: Resources, mocked: respx.MockRouter
 ) -> None:
-    app.dependency_overrides[active_policy] = lambda: Policy(max_size_bytes=50)
+    await use_policy(resources, **TINY_LIMIT)
 
     response = await submit(client, content=samples.PDF * 2000)
 
