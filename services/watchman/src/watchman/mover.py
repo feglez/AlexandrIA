@@ -9,8 +9,9 @@ then, and if this process dies the submission is taken again after that time.
 For each submission it moves the quarantined file into
 Library/<collection>/ with WebDAV MOVE (never overwriting: a taken name gets
 " (2)", " (3)", ...), records it in `library_files`, sets the status to
-`published` and emits `file.published`. A failed attempt is retried with
-back-off; after MAX_ATTEMPTS the submission is `failed`.
+`published`, emits `file.published` and notifies the member in Nextcloud. A
+failed attempt is retried with back-off; after MAX_ATTEMPTS the submission is
+`failed`.
 """
 
 import asyncio
@@ -24,6 +25,7 @@ from pathlib import PurePosixPath
 from redis.exceptions import RedisError
 from sqlalchemy import delete, or_, select, update
 
+from watchman import notifications
 from watchman.db.models import LibraryFile, StatusChange, Submission
 from watchman.files import FilesError
 from watchman.lifecycle import check_transition
@@ -246,12 +248,18 @@ class Mover:
                 "sha256": submission.sha256,
                 "submitted_by": submission.submitted_by,
             }
+            notification = notifications.published(
+                submission,
+                None if curator in (None, ACTOR) else curator,
+                resources.settings.public_base_url,
+            )
         logger.info("Published %s as %s", claim.id, path)
 
         try:
             await resources.events.publish("file.published", curator or ACTOR, data)
         except RedisError as exc:
             logger.error("Cannot publish file.published for %s: %s", claim.id, exc)
+        await resources.notifier.send(notification)
         # The folder is empty now; a folder left behind does no harm.
         folder = f"{resources.settings.quarantine_folder}/{claim.id}"
         try:

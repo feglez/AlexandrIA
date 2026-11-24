@@ -248,7 +248,7 @@ flowchart TB
 |---|---|---|---|
 | Clients → platform | HTTPS through Tailscale Funnel (TLS is terminated by the ingress proxy inside the cluster; the Funnel relays cannot decrypt the traffic) | Sync | Web UI, Nextcloud clients (WebDAV), REST API |
 | watchman → Nextcloud | WebDAV over HTTP | Sync | Upload to quarantine, `MOVE` into the library (no request body, so the file is not uploaded again), `DELETE` |
-| services → Nextcloud | OCS API v2 (`/ocs/v2.php/...`, JSON) | Sync | Validate credentials and read groups (`/cloud/user`), send notifications (`/apps/notifications/api/v2/admin_notifications/{user}`), read storage usage (`/cloud/users/{user}`) |
+| services → Nextcloud | OCS API v2 (`/ocs/v2.php/...`, JSON) | Sync | Validate credentials and read groups (`/cloud/user`), send notifications (`/apps/notifications/api/v3/admin_notifications/{user}`), read storage usage (`/cloud/users/{user}`) |
 | Nextcloud → watchman | HTTP webhooks (`webhook_listeners` app, shared-secret header) | Async (delivered by Nextcloud background jobs) | Files renamed or deleted directly in Nextcloud (for example, a curator tidying the library from the web UI) |
 | watchman → observer | REST/JSON (internal endpoint) | Sync, with timeout and fail-safe | Quota check before accepting a submission |
 | librarian → LLM runtime | HTTP/JSON (Ollama API) | Sync, from a single background worker | Generate an answer from the retrieved passages |
@@ -359,7 +359,7 @@ The platform runs on a **Raspberry Pi 4 Model B (8 GB)** with a **USB SSD** for 
 | Method | Route | Role | Description |
 |---|---|---|---|
 | `POST` | `/submissions` | member | Submit a file (`multipart/form-data`: `file`, `collection`, `note`). `202` with the submission; `422` if a check fails |
-| `GET` | `/submissions` | member / curator | List submissions. Members see their own; curators see all. Filters: `status`, `submitted_by` |
+| `GET` | `/submissions` | member / curator | List submissions. Members see their own; curators see all, or their own with `mine=true`. Filters: `status`, `submitted_by` |
 | `GET` | `/submissions/{id}` | owner / curator | Submission detail with check results and status history |
 | `DELETE` | `/submissions/{id}` | owner | Withdraw a submission that is still `pending_review` (`204`, or `409` if already decided) |
 | `POST` | `/submissions/{id}/approve` | curator | Approve; the file is moved into the library asynchronously |
@@ -399,7 +399,27 @@ When every check passes, the submission is `pending_review`, or `approved` strai
 
 `GET /collections` → `200 OK`: `{ "items": [{ "name": "Manuals", "path": "Library/Manuals" }, ...], "total": 6 }`
 
-`GET /submissions` → `200 OK`: the list format of section 5.1, newest first, each item like the `POST /submissions` answer. `?status=pending_review` gives the submissions waiting for a curator.
+`GET /submissions` → `200 OK`: the list format of section 5.1, newest first, each item like the `POST /submissions` answer. The filters can be combined: `?status=pending_review` gives the submissions waiting for a curator, `?submitted_by=alice` the ones of one member and `?mine=true` the caller's own. A member only ever sees their own submissions, whatever the filters.
+
+`GET /submissions/{id}` → `200 OK`: the submission as above, with its `history`, oldest change first:
+
+```json
+{
+  "id": "sub_01JB8Z5Y0F",
+  "status": "published",
+  "filename": "washing-machine-warranty.pdf",
+  ...
+  "history": [
+    { "from_status": "checking", "to_status": "pending_review", "actor": "alice", "reason": null, "changed_at": "2026-10-19T17:42:10Z" },
+    { "from_status": "pending_review", "to_status": "approved", "actor": "carol", "reason": null, "changed_at": "2026-10-19T18:03:51Z" },
+    { "from_status": "approved", "to_status": "published", "actor": "watchman", "reason": null, "changed_at": "2026-10-19T18:03:53Z" }
+  ]
+}
+```
+
+Only the member who submitted it and the curators can see it; anyone else gets `404`, as for an unknown id. The `reason` of a change is the curator's reason for a rejection, the failed check for an automatic rejection (for example `blocked_type`), `auto_approve` for an automatic approval and the last error when the move failed.
+
+`DELETE /submissions/{id}` → `204 No Content`: the member withdraws a submission that is still `pending_review`. The quarantined file is deleted, and the history records `pending_review → withdrawn` with the member as the actor. Any other status gets `409` with the submission's `current_status`, a curator who did not submit it gets `403` and anyone else `404`.
 
 `POST /submissions/{id}/approve` → `200 OK` with the submission, now `approved`. watchman then moves the file in the background with WebDAV `MOVE` into `Library/<collection>/`, never overwriting a file: if the name is taken, it adds ` (2)`, ` (3)`, ... before the extension. It records the file, sets the status to `published` and emits `file.published`. A failed move is retried with growing pauses; after 5 attempts the submission is `failed`, and approving it again starts over.
 
@@ -410,6 +430,8 @@ When every check passes, the submission is `pending_review`, or `approved` strai
 ```
 
 → `200 OK` with the submission, now `rejected`, or `422` without a reason. Both decisions are stored in the status history with the curator and the time. A decision that the life cycle of section 1.5 does not allow (for example, approving a rejected submission) gets `409` with the submission's `current_status`.
+
+**Notifications.** The member gets a Nextcloud notification (the bell in the web interface) with the outcome: when the file is published, with its path in the library and the curator who approved it (or that the policy approved it), and when a curator rejects it, with the reason. An approval is notified when the file reaches the library, so the files that the policy approves are covered too. watchman sends them as the service account with the notifications app's `admin_notifications` endpoint. If Nextcloud does not take a notification, watchman logs it and does not send it again; the decision stays as it is. Automatic rejections and withdrawals send none, because the member gets the answer straight away.
 
 `PUT /policies` - request:
 
@@ -756,7 +778,7 @@ A new push to a pull request cancels the run that was in progress for it. Runs o
 | `lint` | `ruff check` and `ruff format --check` on `services/`, hadolint on the three Dockerfiles, and `docker compose config` with a copy of `.env.example` |
 | `test` | One job per service. It installs the locked dependencies with `uv sync --locked` and runs the unit and integration tests with pytest. PostgreSQL with pgvector and Redis run as service containers, from the same images as in `compose.yaml`. Nextcloud is mocked |
 | `build` | One job per service and architecture. It builds the image for `linux/amd64` on an x64 runner and for `linux/arm64` on an Arm runner, with a layer cache per service and architecture. On `main` and on tags it also pushes the image to GHCR by digest, without a tag |
-| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): files are submitted through watchman, a curator approves one (it must appear in the library) and rejects another, reads the moderation policy and saves it as a new version, and each result is checked in Nextcloud, PostgreSQL and Redis |
+| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): files are submitted through watchman, a curator approves one (it must appear in the library) and rejects another, the member follows both and gets a Nextcloud notification for each, withdraws a third one, a curator reads the moderation policy and saves it as a new version, and each result is checked in Nextcloud, PostgreSQL and Redis |
 | `publish` | Only on `main` and on tags, once the four jobs above have passed. One job per service: it joins the two images pushed by `build` into one multi-arch image and gives it its tags (9.3) |
 | `ci-ok` | Fails unless every other job succeeded (`publish` is skipped on pull requests). It is the only status check that the `main` ruleset requires, so the ruleset does not depend on the names of the matrix jobs |
 

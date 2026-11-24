@@ -17,6 +17,7 @@ from watchman.auth import NextcloudAuthenticator
 from watchman.config import Settings
 from watchman.events import EventPublisher
 from watchman.files import NextcloudFiles
+from watchman.notifications import Notifier
 from watchman.quota import QuotaClient
 
 
@@ -40,6 +41,7 @@ class Resources:
     nextcloud: httpx.AsyncClient
     authenticator: NextcloudAuthenticator
     files: NextcloudFiles
+    notifier: Notifier
     observer: httpx.AsyncClient
     quota: QuotaClient
     events: EventPublisher
@@ -62,6 +64,9 @@ class Resources:
             nextcloud=nextcloud,
             authenticator=NextcloudAuthenticator(nextcloud, redis, settings.auth_cache_seconds),
             files=NextcloudFiles(
+                nextcloud, settings.nextcloud_service_user, settings.nextcloud_service_password
+            ),
+            notifier=Notifier(
                 nextcloud, settings.nextcloud_service_user, settings.nextcloud_service_password
             ),
             observer=observer,

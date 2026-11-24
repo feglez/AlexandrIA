@@ -58,6 +58,17 @@ decide() {
     expect "$@" -X POST "$WATCHMAN_URL/api/v1/submissions/$id/$action"
 }
 
+# history: the status history of the submission in $body, as "from>to:actor ...".
+history() { field '[.history[] | "\(.from_status)>\(.to_status):\(.actor)"] | join(" ")'; }
+
+# notified CREDENTIALS SUBJECT: print the message of the member's Nextcloud
+# notification with this subject.
+notified() {
+    expect 200 -u "$1" -H "OCS-APIRequest: true" \
+        "$NEXTCLOUD_URL/ocs/v2.php/apps/notifications/api/v2/notifications?format=json"
+    jq -er --arg subject "$2" '.ocs.data[] | select(.subject == $subject) | .message' "$body"
+}
+
 run_id="$(date -u +%Y%m%d%H%M%S)-$RANDOM$RANDOM"
 
 step "watchman lists the library collections"
@@ -103,6 +114,17 @@ step "carol sees it among the pending submissions"
 expect 200 -u "$CAROL" "$WATCHMAN_URL/api/v1/submissions?status=pending_review&limit=100"
 [[ $(field ".items[] | select(.id == \"$id\") | .submitted_by") == alice ]] ||
     fail "$id is not in the pending list"
+expect 200 -u "$CAROL" "$WATCHMAN_URL/api/v1/submissions?mine=true&limit=100"
+if field '.items[].id' | grep -qx "$id"; then fail "$id is in carol's own submissions"; fi
+
+step "alice follows her submission, which bob cannot see"
+expect 200 -u "$ALICE" "$WATCHMAN_URL/api/v1/submissions?mine=true&limit=100"
+[[ $(field ".items[] | select(.id == \"$id\") | .status") == pending_review ]] ||
+    fail "$id is not in alice's submissions"
+expect 200 -u "$ALICE" "$WATCHMAN_URL/api/v1/submissions/$id"
+[[ $(history) == "checking>pending_review:alice" ]] || fail "history: '$(history)'"
+[[ $(field '.checks | length') == 5 ]] || fail "the detail has no check results"
+expect 404 -u "$BOB" "$WATCHMAN_URL/api/v1/submissions/$id"
 
 step "carol approves it"
 decide "$id" approve 200 -u "$CAROL"
@@ -132,6 +154,12 @@ stored=$(query "SELECT s.status || ' ' || f.path FROM submissions s
                 JOIN library_files f ON f.submission_id = s.id WHERE s.id = '$id'")
 [[ $stored == "published Library/Manuals/$name" ]] || fail "database: '$stored'"
 
+# The mover sends the notification before it deletes the quarantine folder.
+step "alice is notified in Nextcloud"
+message=$(notified "$ALICE" "Your file $name is in the library")
+[[ $message == "carol approved it, and it is now at Library/Manuals/$name." ]] ||
+    fail "notification: '$message'"
+
 step "file.published was published"
 docker compose exec -T redis redis-cli -n 1 --raw XREVRANGE alexandria.events + - COUNT 50 |
     grep -F "\"$id\"" | grep -q '"file.published"' || fail "no file.published for $id"
@@ -157,10 +185,33 @@ expect 404 -X PROPFIND -H "Depth: 0" -u "$SERVICE" "$DAV/alexandria/Quarantine/$
 stored=$(query "SELECT to_status || ':' || actor || ':' || reason FROM status_history
                 WHERE submission_id = '$rejected' ORDER BY id DESC LIMIT 1")
 [[ $stored == "rejected:carol:Smoke test" ]] || fail "history: '$stored'"
+message=$(notified "$ALICE" "Your file $other was rejected")
+[[ $message == "carol rejected it. Reason: Smoke test" ]] || fail "notification: '$message'"
 
 step "A decided submission cannot be decided again"
 decide "$rejected" approve 409 -u "$CAROL"
 [[ $(field .current_status) == rejected ]] || fail "current_status is not rejected"
+
+step "alice withdraws a pending submission"
+third="smoke-$run_id-withdrawn.txt"
+printf 'To be withdrawn, run %s.\n' "$run_id" > "$work/$third"
+expect 202 -u "$ALICE" -F "file=@$work/$third" -F collection=Manuals \
+    "$WATCHMAN_URL/api/v1/submissions"
+withdrawn=$(field .id)
+expect 404 -u "$BOB" -X DELETE "$WATCHMAN_URL/api/v1/submissions/$withdrawn"
+expect 403 -u "$CAROL" -X DELETE "$WATCHMAN_URL/api/v1/submissions/$withdrawn"
+expect 204 -u "$ALICE" -X DELETE "$WATCHMAN_URL/api/v1/submissions/$withdrawn"
+expect 404 -X PROPFIND -H "Depth: 0" -u "$SERVICE" "$DAV/alexandria/Quarantine/$withdrawn"
+expect 200 -u "$ALICE" "$WATCHMAN_URL/api/v1/submissions/$withdrawn"
+[[ $(field .status) == withdrawn ]] || fail "status is not withdrawn"
+[[ $(history) == "checking>pending_review:alice pending_review>withdrawn:alice" ]] ||
+    fail "history: '$(history)'"
+
+step "Only pending submissions can be withdrawn"
+for sub in "$withdrawn:withdrawn" "$rejected:rejected" "$id:published"; do
+    expect 409 -u "$ALICE" -X DELETE "$WATCHMAN_URL/api/v1/submissions/${sub%%:*}"
+    [[ $(field .current_status) == "${sub#*:}" ]] || fail "current_status is not ${sub#*:}"
+done
 
 POLICIES="$WATCHMAN_URL/api/v1/policies"
 
