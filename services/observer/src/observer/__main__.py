@@ -2,7 +2,8 @@
 
 1. Apply the database migrations.
 2. Serve the public API (PUBLIC_PORT) and the internal API (INTERNAL_PORT)
-   from the same process. Scaling is done by running more containers.
+   from the same process, and run the consumer that records the domain
+   events in the usage ledger. Scaling is done by running more containers.
 """
 
 import asyncio
@@ -15,6 +16,7 @@ import uvicorn
 
 from observer.app import create_internal_app, create_public_app
 from observer.config import Settings
+from observer.consumer import EventConsumer
 from observer.db.migrate import upgrade_database
 from observer.resources import Resources
 
@@ -58,9 +60,13 @@ async def serve(settings: Settings) -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop)
+    consumer = asyncio.create_task(EventConsumer(resources).run(), name="consumer")
     try:
         await asyncio.gather(*(server.serve() for server in servers))
     finally:
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
         await resources.aclose()
 
 
