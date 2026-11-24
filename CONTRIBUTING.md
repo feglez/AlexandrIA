@@ -99,7 +99,7 @@ TEST_REDIS_URL=redis://127.0.0.1:56379/0 uv run pytest
 docker stop test-pg test-redis
 ```
 
-Without `TEST_DATABASE_URL` and `TEST_REDIS_URL` the integration tests are skipped (they fail instead when the `CI` variable is set). Each run recreates the database `test_<service>`. Nextcloud is never called for real in these tests: its answers are mocked with respx.
+Without `TEST_DATABASE_URL` and `TEST_REDIS_URL` the integration tests are skipped (they fail instead when the `CI` variable is set). Each run recreates the database `test_<service>`. Nextcloud is never called for real in these tests: its answers are mocked with respx. librarian's relevance tests use the real embedding model: the first time, fastembed downloads it (about 240 MB) to `FASTEMBED_CACHE_PATH`, or to `fastembed_cache` in the system's temporary directory. If it cannot be downloaded, they are skipped, except in CI.
 
 **Smoke test.** With the stack running (`docker compose up -d --wait`), `tests/smoke/smoke.sh` tries the main flow through the published ports, with the real Nextcloud. It reads the passwords from `.env` and needs curl and jq. It submits new content on every run, so it can run again on the same volumes.
 

@@ -279,7 +279,7 @@ Nextcloud delivers webhooks from background jobs (every ~5 minutes with cron, or
 }
 ```
 
-watchman emits `file.published` once the file is in the library, with the curator who approved it as `actor` (`watchman` when the moderation policy approved it automatically). `submission.decided` has the curator as `actor`, and its `data` holds `submission_id`, `decision` (`approved` or `rejected`), `reason`, `filename`, `collection` and `submitted_by`.
+watchman emits `file.published` once the file is in the library, with the curator who approved it as `actor` (`watchman` when the moderation policy approved it automatically). `submission.decided` has the curator as `actor`, and its `data` holds `submission_id`, `decision` (`approved` or `rejected`), `reason`, `filename`, `collection` and `submitted_by`. librarian emits `search.performed` for every search that gets an answer, with the member who searched as `actor`; its `data` holds `k`, `collection` and the number of `results`, but not the query.
 
 observer reads the stream in its own consumer group and records the usage of each member per month (UTC, from `occurred_at`):
 
@@ -529,6 +529,8 @@ Each `PUT` stores a new version with the curator who saved it, and the latest ve
 }
 ```
 
+`q` must have 3 to 500 characters once the spaces at either end are removed, and `k` must be between 1 and 20 (5 by default); otherwise the answer is `422` with the validation errors. librarian computes the embedding of `q` with the model it uses for the documents (8.6) and returns the `k` passages closest to it by cosine distance, the closest first. It only searches documents with status `indexed`, and only in `collection` if it is given. Files are only indexed once they are published, so files in quarantine and rejected ones are never found. Several passages of the same document can appear. `score` is 1 minus the cosine distance, so higher is closer, and there is no minimum: the answer has `k` results whenever the searched documents have at least `k` passages. `snippet` is the passage on one line, cut after a word at 300 characters. `url` opens the file in Nextcloud (`<PUBLIC_BASE_URL>/f/<file id>`), and `took_ms` is the time spent computing the embedding and searching. Every search that gets an answer counts as one search of the member (4.3).
+
 `POST /reindex` - request `{ "collection": "Manuals" }` → `202 Accepted` `{ "job_id": "job_01JB9B7K", "status": "queued" }`
 
 ### 5.4 observer - usage, quotas and reports
@@ -718,7 +720,7 @@ Accounts created on the first start, with the passwords from `.env`:
 
 Measured with `docker stats` and `docker images` on amd64:
 
-- **RAM:** about 0.65 GB for everything except Ollama. Ollama with `qwen2.5:1.5b` uses 0.4 to 0.6 GB when idle and about 2.1 GB while it generates an answer, so the whole stack needs about 2.75 GB. On a machine with less memory, use a smaller model such as `qwen2.5:0.5b`.
+- **RAM:** about 1.1 GB for everything except Ollama, half of it in librarian, which keeps the embedding model in memory. Ollama with `qwen2.5:1.5b` uses 0.4 to 0.6 GB when idle and about 2.1 GB while it generates an answer, so the whole stack needs about 3.2 GB. On a machine with less memory, use a smaller model such as `qwen2.5:0.5b`.
 - **Disk:** the Ollama image takes 8.5 GB (a 3.4 GB download, it includes GPU libraries) plus about 1 GB for the model, the Nextcloud image 2.1 GB, and our images the sizes in 8.7.
 
 How to run the linters and the tests is described in [CONTRIBUTING.md](CONTRIBUTING.md#local-development).
@@ -787,7 +789,7 @@ Both listeners run in the same process. Compose only publishes port 8000 (7.2).
 
 ### 8.6 librarian: embedding model in the image
 
-The `model` stage downloads `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` with the locked fastembed version, which resolves it to the quantised ONNX export `Qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q` (384 dimensions, 241 MB). The runtime stage copies it to `/models` and points `FASTEMBED_CACHE_PATH` there. So the container needs no Internet access, starts without a download, and every image tag carries a fixed model. The stage starts from the dependency layer, so a code change does not download the model again. The image also sets `HF_HUB_OFFLINE=1` and `ORT_DISABLE_TELEMETRY=1`, and computing an embedding works with `--network none`.
+The `model` stage downloads `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` with the locked fastembed version, which resolves it to the quantised ONNX export `Qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q` (384 dimensions, 241 MB). The runtime stage copies it to `/models` and points `FASTEMBED_CACHE_PATH` there. So the container needs no Internet access, starts without a download, and every image tag carries a fixed model. The stage starts from the dependency layer, so a code change does not download the model again. The image also sets `HF_HUB_OFFLINE=1` and `ORT_DISABLE_TELEMETRY=1`, and computing an embedding works with `--network none`. librarian loads the model once, when it starts, and stops if it does not give 384 dimensions, the size of the vectors in its database.
 
 ### 8.7 Sizes
 
@@ -824,9 +826,9 @@ A new push to a pull request cancels the run that was in progress for it. Runs o
 | Job | What it does |
 |---|---|
 | `lint` | `ruff check` and `ruff format --check` on `services/`, hadolint on the three Dockerfiles, and `docker compose config` with a copy of `.env.example` |
-| `test` | One job per service. It installs the locked dependencies with `uv sync --locked` and runs the unit and integration tests with pytest. PostgreSQL with pgvector and Redis run as service containers, from the same images as in `compose.yaml`. Nextcloud is mocked |
+| `test` | One job per service. It installs the locked dependencies with `uv sync --locked` and runs the unit and integration tests with pytest. PostgreSQL with pgvector and Redis run as service containers, from the same images as in `compose.yaml`. Nextcloud is mocked. librarian's relevance tests search a small library in Spanish and English with the real embedding model, which is downloaded once and then restored from the Actions cache |
 | `build` | One job per service and architecture. It builds the image for `linux/amd64` on an x64 runner and for `linux/arm64` on an Arm runner, with a layer cache per service and architecture. On `main` and on tags it also pushes the image to GHCR by digest, without a tag |
-| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): a curator sets the members' quotas, files are submitted through watchman, a curator approves one (it must appear in the library) and rejects another, the member follows both and gets a Nextcloud notification for each, withdraws a third one, a curator reads the moderation policy and saves it as a new version, a trusted member's file is published without a curator, and while observer is stopped the next one waits for a curator, observer adds the published file and the accepted submissions to the member's usage, only a curator sees everyone's usage, a file over the submitter's quota is rejected, observer's internal port is not published, and a curator gets last month's cost-split report. Each result is checked in Nextcloud, PostgreSQL and Redis |
+| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): a curator sets the members' quotas, files are submitted through watchman, a curator approves one (it must appear in the library) and rejects another, the member follows both and gets a Nextcloud notification for each, withdraws a third one, a curator reads the moderation policy and saves it as a new version, a trusted member's file is published without a curator, and while observer is stopped the next one waits for a curator, the member searches the library (the answer's fields, a collection filter and invalid queries), observer adds the published file, the accepted submissions and the searches to the member's usage, only a curator sees everyone's usage, a file over the submitter's quota is rejected, observer's internal port is not published, and a curator gets last month's cost-split report. Each result is checked in Nextcloud, PostgreSQL and Redis |
 | `publish` | Only on `main` and on tags, once the four jobs above have passed. One job per service: it joins the two images pushed by `build` into one multi-arch image and gives it its tags (9.3) |
 | `ci-ok` | Fails unless every other job succeeded (`publish` is skipped on pull requests). It is the only status check that the `main` ruleset requires, so the ruleset does not depend on the names of the matrix jobs |
 

@@ -22,3 +22,6 @@ class Settings(BaseSettings):
 
     # Embedding model, baked into the image (see the Dockerfile).
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+    # Redis stream of the domain events.
+    events_stream: str = "alexandria.events"

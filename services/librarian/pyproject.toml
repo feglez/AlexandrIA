@@ -9,6 +9,7 @@ dependencies = [
     "fastembed>=0.9",
     "fastapi>=0.165",
     "httpx>=0.28",
+    "pgvector>=0.5.1",
     "pydantic-settings>=2.16",
     "python-ulid>=4.2",
     "redis>=8.1",

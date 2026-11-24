@@ -18,6 +18,7 @@ set +a
 
 NEXTCLOUD_URL=${SMOKE_NEXTCLOUD_URL:-http://127.0.0.1:8080}
 WATCHMAN_URL=${SMOKE_WATCHMAN_URL:-http://127.0.0.1:8081}
+LIBRARIAN_URL=${SMOKE_LIBRARIAN_URL:-http://127.0.0.1:8082}
 OBSERVER_URL=${SMOKE_OBSERVER_URL:-http://127.0.0.1:8083}
 ALICE="alice:${DEMO_ALICE_PASSWORD}"
 BOB="bob:${DEMO_BOB_PASSWORD}"
@@ -166,6 +167,7 @@ usage "$ALICE"
     fail "the contribution quota is not alice's quota"
 contributed=$(field .library_contribution.used_bytes)
 submitted=$(field .submissions.this_period)
+searched=$(field .searches.this_period)
 storage=$(field .personal_storage.used_bytes)
 expect 200 -u "$ALICE" -H "OCS-APIRequest: true" \
     "$NEXTCLOUD_URL/ocs/v2.php/cloud/users/alice?format=json"
@@ -259,6 +261,41 @@ usage "$ALICE"
 size=$(wc -c < "$work/$name")
 [[ $(field .library_contribution.used_bytes) == $((contributed + size)) ]] ||
     fail "contribution is not $((contributed + size)) bytes"
+
+# What the index holds depends on earlier runs on the same volumes, so these
+# steps check the shape of the answer, not which passages it finds.
+step "alice searches the library"
+expect 200 -u "$ALICE" -G --data-urlencode "q=  electricity bill " -d k=3 \
+    "$LIBRARIAN_URL/api/v1/search"
+[[ $(field .query) == "electricity bill" ]] || fail "the query is not trimmed"
+jq -e --arg url "${PUBLIC_BASE_URL:-http://localhost:8080}/f/" '
+    (.took_ms | type) == "number" and (.results | length) <= 3 and
+    all(.results[]; (.document_id | startswith("doc_")) and (.path | startswith("Library/"))
+        and (.collection | type) == "string" and (.snippet | type) == "string"
+        and (.score | type) == "number" and (.url | startswith($url)))' "$body" > /dev/null ||
+    fail "the search answer does not have the expected fields"
+
+step "alice searches one collection"
+expect 200 -u "$ALICE" -G --data-urlencode "q=washing machine warranty" -d collection=Manuals \
+    "$LIBRARIAN_URL/api/v1/search"
+jq -e '(.results | length) <= 5 and all(.results[]; .collection == "Manuals")' "$body" \
+    > /dev/null || fail "a result is not from Manuals"
+
+step "Invalid searches are refused"
+expect 422 -u "$ALICE" "$LIBRARIAN_URL/api/v1/search?q=ab"
+[[ $(field '.errors[0].loc | join(".")') == query.q ]] || fail "the error is not about q"
+expect 422 -u "$ALICE" -G --data-urlencode "q=$(printf '%501s' '' | tr ' ' a)" \
+    "$LIBRARIAN_URL/api/v1/search"
+expect 422 -u "$ALICE" "$LIBRARIAN_URL/api/v1/search?q=warranty&k=21"
+# No wrong password here: Nextcloud would count it against librarian's address.
+expect 401 "$LIBRARIAN_URL/api/v1/search?q=warranty"
+
+# Only the two searches that got an answer count.
+step "observer counts alice's searches"
+drained
+usage "$ALICE"
+[[ $(field .searches.this_period) == $((searched + 2)) ]] ||
+    fail "searches this month are not $((searched + 2))"
 
 step "The same content again is a duplicate"
 cp "$work/$name" "$work/copy-$name"
