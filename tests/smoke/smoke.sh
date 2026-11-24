@@ -115,6 +115,34 @@ drained() {
 # usage CREDENTIALS: the member's usage from observer, in $body.
 usage() { expect 200 -u "$1" "$OBSERVER_URL/api/v1/usage/me"; }
 
+# wait_for DEADLINE MESSAGE COMMAND...: run COMMAND every second until it
+# succeeds; fail with MESSAGE once DEADLINE (seconds since the epoch) is past.
+wait_for() {
+    local deadline=$1 message=$2
+    shift 2
+    until "$@"; do
+        (($(date +%s) < deadline)) || fail "$message"
+        sleep 1
+    done
+}
+
+# indexed FILE_ID [STATUS [PATH]]: is the file in librarian's index, with this
+# status (indexed by default) and path?
+indexed() {
+    local stored
+    stored=$(query "SELECT status || ' ' || path FROM documents WHERE file_id = $1" librarian)
+    [[ $stored == "${2:-indexed} ${3:-}"* ]]
+}
+
+# gone FILE_ID: is the file out of librarian's index?
+gone() { [[ -z $(query "SELECT id FROM documents WHERE file_id = $1" librarian) ]]; }
+
+# job_done JOB_ID: has the re-index job finished? Leaves the job in $body.
+job_done() {
+    curl -sS -o "$body" -u "$CAROL" "$LIBRARIAN_URL/api/v1/reindex/$1" &&
+        [[ $(jq -r .status "$body") == "done" ]]
+}
+
 # quota CREDENTIALS MEMBER JSON: set the member's quota.
 quota() { expect 200 -u "$1" -X PUT "${json[@]}" -d "$3" "$OBSERVER_URL/api/v1/quotas/$2"; }
 
@@ -133,6 +161,10 @@ observer_up() {
 }
 
 run_id="$(date -u +%Y%m%d%H%M%S)-$RANDOM$RANDOM"
+LIBRARY="$DAV/alexandria/Library"
+# What alice's file says, and a question about it with none of its words.
+LIGHTHOUSE="The lighthouse keeper rows to the island every morning to feed the seagulls."
+SEAGULLS="q=who gives food to the birds near the coast"
 # Every run adds files and submissions for alice and bob, so they get a quota
 # larger than the default one: the test can run many times on the same volumes.
 QUOTA='{"max_contribution_bytes": 10737418240, "max_submissions_per_month": 1000}'
@@ -176,7 +208,7 @@ expect 200 -u "$ALICE" -H "OCS-APIRequest: true" \
 
 step "alice submits a file"
 name="smoke-$run_id.md"
-printf '# Smoke test\n\nRun %s.\n' "$run_id" > "$work/$name"
+printf '# Smoke test %s\n\n%s\n' "$run_id" "$LIGHTHOUSE" > "$work/$name"
 expect 202 -u "$ALICE" -F "file=@$work/$name" -F collection=Manuals -F "note=Smoke test" \
     "$WATCHMAN_URL/api/v1/submissions"
 id=$(field .id)
@@ -226,6 +258,7 @@ expect 404 -u "$BOB" "$WATCHMAN_URL/api/v1/submissions/$id"
 
 step "carol approves it"
 decide "$id" approve 200 -u "$CAROL"
+approved_at=$(date +%s)
 [[ $(field .status) == approved ]] || fail "status is not approved"
 
 # The mover publishes it in the background.
@@ -297,6 +330,29 @@ usage "$ALICE"
 [[ $(field .searches.this_period) == $((searched + 2)) ]] ||
     fail "searches this month are not $((searched + 2))"
 
+# The searches from here on are bob's, whose searches are not counted above.
+step "librarian indexes alice's file within 60 s of the approval"
+file_id=$(query "SELECT file_id FROM library_files WHERE submission_id = '$id'")
+wait_for $((approved_at + 60)) "alice's file is not indexed 60 s after the approval" \
+    indexed "$file_id" indexed "Library/Manuals/$name"
+echo "indexed $(($(date +%s) - approved_at)) s after the approval"
+
+step "bob finds alice's file by what it means"
+expect 200 -u "$BOB" -G --data-urlencode "$SEAGULLS" -d k=20 "$LIBRARIAN_URL/api/v1/search"
+document=$(jq -er --arg path "Library/Manuals/$name" \
+    'first(.results[] | select(.path == $path)) | .document_id' "$body") ||
+    fail "alice's file is not among the results"
+jq -e --arg id "$document" --arg url "${PUBLIC_BASE_URL:-http://localhost:8080}/f/$file_id" '
+    first(.results[] | select(.document_id == $id)) |
+    .url == $url and .collection == "Manuals" and (.snippet | contains("lighthouse keeper"))' \
+    "$body" > /dev/null || fail "the result does not link to the file in Nextcloud"
+
+step "alice reads the document of her file"
+expect 200 -u "$ALICE" "$LIBRARIAN_URL/api/v1/documents/$document"
+[[ $(field .status) == indexed ]] || fail "status is not indexed"
+[[ $(field .path) == "Library/Manuals/$name" ]] || fail "wrong path"
+[[ $(field .chunks) -ge 1 ]] || fail "the document has no passages"
+
 step "The same content again is a duplicate"
 cp "$work/$name" "$work/copy-$name"
 expect 422 -u "$ALICE" -F "file=@$work/copy-$name" -F collection=Manuals \
@@ -324,12 +380,16 @@ step "A decided submission cannot be decided again"
 decide "$rejected" approve 409 -u "$CAROL"
 [[ $(field .current_status) == rejected ]] || fail "current_status is not rejected"
 
-step "alice withdraws a pending submission"
+step "alice withdraws a pending submission, which is never found"
 third="smoke-$run_id-withdrawn.txt"
-printf 'To be withdrawn, run %s.\n' "$run_id" > "$work/$third"
+printf 'The beekeeper of the valley harvests lavender honey, run %s.\n' "$run_id" > "$work/$third"
 expect 202 -u "$ALICE" -F "file=@$work/$third" -F collection=Manuals \
     "$WATCHMAN_URL/api/v1/submissions"
 withdrawn=$(field .id)
+expect 200 -u "$BOB" -G --data-urlencode "q=beekeeper harvesting lavender honey" \
+    "$LIBRARIAN_URL/api/v1/search"
+jq -e 'all(.results[]; .snippet | contains("beekeeper") | not)' "$body" > /dev/null ||
+    fail "a file in quarantine was found"
 expect 404 -u "$BOB" -X DELETE "$WATCHMAN_URL/api/v1/submissions/$withdrawn"
 expect 403 -u "$CAROL" -X DELETE "$WATCHMAN_URL/api/v1/submissions/$withdrawn"
 expect 204 -u "$ALICE" -X DELETE "$WATCHMAN_URL/api/v1/submissions/$withdrawn"
@@ -399,6 +459,24 @@ grep -q "$trusted" "$body" || fail "$trusted is not in bob's Library/Manuals"
 message=$(notified "$BOB" "Your file $trusted is in the library")
 [[ $message == "It was approved automatically, and it is now at Library/Manuals/$trusted." ]] ||
     fail "notification: '$message'"
+
+step "A published PDF that cannot be read is marked failed, for the curators to see"
+broken="smoke-$run_id-broken.pdf"
+printf '%%PDF-1.4\nNot really a PDF, run %s.\n' "$run_id" > "$work/$broken"
+expect 202 -u "$BOB" -F "file=@$work/$broken" -F collection=Manuals \
+    "$WATCHMAN_URL/api/v1/submissions"
+broken_id=$(field .id)
+[[ $(field .status) == approved ]] || fail "status is not approved"
+moved "$broken_id"
+broken_file=$(query "SELECT file_id FROM library_files WHERE submission_id = '$broken_id'")
+wait_for $(($(date +%s) + 60)) "the broken PDF is not failed after 60 s" \
+    indexed "$broken_file" failed
+expect 200 -u "$CAROL" "$LIBRARIAN_URL/api/v1/documents?status=failed&collection=Manuals&limit=100"
+jq -e --arg path "Library/Manuals/$broken" '
+    any(.items[]; .path == $path and .attempts >= 1 and .next_attempt_at != null
+        and (.error | startswith("Cannot read the file as pdf")))' "$body" > /dev/null ||
+    fail "the broken PDF is not in the failed documents"
+expect 403 -u "$BOB" "$LIBRARIAN_URL/api/v1/documents"
 
 # watchman does not depend on observer: if the quota check gets no answer, the
 # file waits for a curator, even from a trusted member (fail-safe).
@@ -482,6 +560,45 @@ expect 200 -u "$CAROL" "$OBSERVER_URL/api/v1/usage?limit=100"
 field '.items[] | select(.user == "bob") | .submissions.this_period' > /dev/null ||
     fail "bob is not in the list"
 expect 422 -u "$CAROL" "$OBSERVER_URL/api/v1/usage?period=2026-13"
+
+# Changes made directly in Nextcloud reach watchman through the webhooks.
+step "Moving alice's file to another collection in Nextcloud moves it in the index"
+expect 201 -u "$SERVICE" -X MOVE -H "Destination: $LIBRARY/School/$name" "$LIBRARY/Manuals/$name"
+wait_for $(($(date +%s) + 60)) "the index does not have the new path after 60 s" \
+    indexed "$file_id" indexed "Library/School/$name"
+stored=$(query "SELECT path || ' ' || collection FROM library_files WHERE file_id = $file_id")
+[[ $stored == "Library/School/$name School" ]] || fail "library_files: '$stored'"
+expect 200 -u "$BOB" -G --data-urlencode "$SEAGULLS" -d collection=School \
+    "$LIBRARIAN_URL/api/v1/search"
+jq -e --arg id "$document" 'any(.results[]; .document_id == $id and .collection == "School")' \
+    "$body" > /dev/null || fail "alice's file is not found in School"
+
+step "carol re-indexes the collection"
+before=$(query "SELECT indexed_at FROM documents WHERE file_id = $file_id" librarian)
+expect 403 -u "$ALICE" -X POST "$LIBRARIAN_URL/api/v1/reindex"
+expect 202 -u "$CAROL" -X POST "${json[@]}" -d '{"collection": "School"}' \
+    "$LIBRARIAN_URL/api/v1/reindex"
+job=$(field .job_id)
+[[ $(field .status) == queued ]] || fail "the job is not queued"
+wait_for $(($(date +%s) + 60)) "the re-index job is not done after 60 s" job_done "$job"
+[[ $(field .documents) -ge 1 && $(field .pending) == 0 ]] || fail "the job did not index School"
+[[ $(query "SELECT indexed_at > '$before' FROM documents WHERE file_id = $file_id" librarian) == t ]] ||
+    fail "alice's file was not indexed again"
+
+step "Deleting alice's file in Nextcloud removes it from the index and from her contribution"
+expect 204 -u "$SERVICE" -X DELETE "$LIBRARY/School/$name"
+wait_for $(($(date +%s) + 60)) "the file is still in the index after 60 s" gone "$file_id"
+expect 404 -u "$ALICE" "$LIBRARIAN_URL/api/v1/documents/$document"
+[[ -z $(query "SELECT file_id FROM library_files WHERE file_id = $file_id") ]] ||
+    fail "watchman still has the file"
+drained
+usage "$ALICE"
+[[ $(field .library_contribution.used_bytes) == "$contributed" ]] ||
+    fail "contribution is not back to $contributed bytes"
+# The broken PDF goes too, so failed documents do not pile up over many runs.
+expect 204 -u "$SERVICE" -X DELETE "$LIBRARY/Manuals/$broken"
+wait_for $(($(date +%s) + 60)) "the broken PDF is still in the index after 60 s" \
+    gone "$broken_file"
 
 step "Submissions without credentials are rejected"
 expect 401 -F "file=@$work/$name" -F collection=Manuals "$WATCHMAN_URL/api/v1/submissions"

@@ -32,5 +32,9 @@ class Settings(BaseSettings):
     observer_internal_token: str
     quota_check_timeout_seconds: float = 2.0
 
+    # Secret that Nextcloud sends, as a bearer token, with its webhook calls
+    # to the internal API.
+    webhook_secret: str
+
     # Redis stream of the domain events.
     events_stream: str = "alexandria.events"

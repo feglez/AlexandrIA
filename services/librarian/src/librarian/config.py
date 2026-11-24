@@ -23,5 +23,18 @@ class Settings(BaseSettings):
     # Embedding model, baked into the image (see the Dockerfile).
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
-    # Redis stream of the domain events.
+    # Redis stream of the domain events, and librarian's consumer group.
     events_stream: str = "alexandria.events"
+    events_group: str = "librarian"
+
+    # Service account that owns the Library folder: librarian reads the
+    # files as this account.
+    nextcloud_service_user: str = "alexandria"
+    nextcloud_service_password: str
+    library_folder: str = "Library"
+    # Larger files are not indexed.
+    max_file_bytes: int = 50 * 1024 * 1024
+    # How often the index is compared with the files of the library, and how
+    # soon to try again when Nextcloud does not answer.
+    reconcile_seconds: float = 900.0
+    reconcile_retry_seconds: float = 60.0

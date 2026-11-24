@@ -4,7 +4,7 @@
 
 > Cloud-native business layer on top of a self-hosted **Nextcloud**, running on a **Raspberry Pi 4** as an on-premises private cloud (K3s).
 >
-> Lab project for *Cloud Computing: Fundamentals and Infrastructures* (2026-27). **Current status: Hito 1 - project definition, business model and reference architecture.**
+> Lab project for *Cloud Computing: Fundamentals and Infrastructures* (2026-27). **Current status: Hito 2 - packaging, local environment and continuous integration.** Every component of section 4 runs in the local environment of section 7, except the answers to questions (`POST /questions`, issue #8), which are not implemented yet.
 
 ## Table of contents
 
@@ -256,7 +256,7 @@ flowchart TB
 | librarian → observer | Redis Streams | Async | `search.performed` and `question.answered` usage events |
 | services → PostgreSQL | PostgreSQL wire protocol | Sync | Each service owns its database; no service reads another's tables |
 
-Nextcloud delivers webhooks from background jobs (every ~5 minutes with cron, or in near real time with a dedicated background-job worker). The main flow does not depend on them: publications are events emitted by watchman itself.
+Nextcloud delivers webhooks from background jobs (every ~5 minutes with cron, or in near real time with a dedicated background-job worker; compose runs one, 7.2). The main flow does not depend on them: publications are events emitted by watchman itself. Nextcloud does not send a failed call again, so librarian also compares its index with the library now and then (5.3).
 
 **Event envelope** (one stream, `alexandria.events`; each stream entry holds the envelope as JSON in a field named `event`):
 
@@ -280,6 +280,10 @@ Nextcloud delivers webhooks from background jobs (every ~5 minutes with cron, or
 ```
 
 watchman emits `file.published` once the file is in the library, with the curator who approved it as `actor` (`watchman` when the moderation policy approved it automatically). `submission.decided` has the curator as `actor`, and its `data` holds `submission_id`, `decision` (`approved` or `rejected`), `reason`, `filename`, `collection` and `submitted_by`. librarian emits `search.performed` for every search that gets an answer, with the member who searched as `actor`; its `data` holds `k`, `collection` and the number of `results`, but not the query.
+
+watchman emits `file.renamed` and `file.removed` when Nextcloud's webhooks tell it that a file it published was moved or deleted; a folder counts for every published file inside it, and a file moved out of the collections of the library counts as removed. Their `data` holds `file_id`, `path` (the new one for `file.renamed`, which also has `old_path`), `collection`, `size_bytes`, `submitted_by` and `submission_id`, and their `actor` is the Nextcloud account that made the change. Changes to other files, like watchman's own moves out of the quarantine, emit nothing.
+
+librarian reads the stream in its own consumer group: it indexes the files of `file.published` and follows `file.renamed` and `file.removed` (5.3).
 
 observer reads the stream in its own consumer group and records the usage of each member per month (UTC, from `occurred_at`):
 
@@ -475,8 +479,8 @@ Each `PUT` stores a new version with the curator who saved it, and the latest ve
 | `POST` | `/questions` | member | Ask a question about the library (`question`, optional `collection`). `202` with the question id; questions are queued and answered one at a time |
 | `GET` | `/questions/{id}` | owner | Question status (`queued`, `answering`, `answered`, `failed`) and, once answered, the answer with its sources |
 | `GET` | `/search` | member | Semantic search, without generating an answer. Query: `q` (required, 3-500 chars), `k` (1-20, default 5), `collection` |
-| `GET` | `/documents` | curator | Indexed documents. Filter `status`: `indexed`, `pending`, `failed`, `skipped` |
-| `GET` | `/documents/{id}` | member | Document metadata (path, collection, chunks, indexed at) |
+| `GET` | `/documents` | curator | Documents of the index. Filters: `status` (`indexed`, `pending`, `failed`, `skipped`), `collection` |
+| `GET` | `/documents/{id}` | member | Document metadata (path, collection, status, chunks, indexed at) |
 | `POST` | `/reindex` | curator | Start a full or per-collection re-index job (`202` with job id) |
 | `GET` | `/reindex/{job_id}` | curator | Re-index job progress |
 
@@ -531,7 +535,43 @@ Each `PUT` stores a new version with the curator who saved it, and the latest ve
 
 `q` must have 3 to 500 characters once the spaces at either end are removed, and `k` must be between 1 and 20 (5 by default); otherwise the answer is `422` with the validation errors. librarian computes the embedding of `q` with the model it uses for the documents (8.6) and returns the `k` passages closest to it by cosine distance, the closest first. It only searches documents with status `indexed`, and only in `collection` if it is given. Files are only indexed once they are published, so files in quarantine and rejected ones are never found. Several passages of the same document can appear. `score` is 1 minus the cosine distance, so higher is closer, and there is no minimum: the answer has `k` results whenever the searched documents have at least `k` passages. `snippet` is the passage on one line, cut after a word at 300 characters. `url` opens the file in Nextcloud (`<PUBLIC_BASE_URL>/f/<file id>`), and `took_ms` is the time spent computing the embedding and searching. Every search that gets an answer counts as one search of the member (4.3).
 
-`POST /reindex` - request `{ "collection": "Manuals" }` → `202 Accepted` `{ "job_id": "job_01JB9B7K", "status": "queued" }`
+**Indexing.** librarian downloads each published file from Nextcloud as the service account, extracts its text, cuts it into passages and embeds them. It reads PDF (with pypdf), DOCX (with python-docx), Markdown and plain-text files, told by their extension; other types are recorded as `skipped`, and so are files larger than 50 MB and files without text (a scanned PDF, for example). A passage has at most 800 characters: whole paragraphs are put together while they fit, a longer paragraph is cut after a word, and each passage starts with about the last 150 characters of the one before when they fit. A file published again with the same SHA-256 is not indexed again. A document that cannot be indexed (a broken file, or Nextcloud not answering) is `failed`, with the `error`, and is tried again 30 seconds later, then after 1, 2 and 4 minutes; after five failed attempts only a re-index tries it again. A document waiting to be indexed again stays searchable, a moved file keeps its passages under its new `path` and `collection`, and a file that is no longer in Nextcloud leaves the index. Each librarian replica indexes one document at a time, and two replicas never take the same one.
+
+**Reconciliation.** When it starts and then every 15 minutes, librarian lists the library (one WebDAV `PROPFIND` with `Depth: infinity`) and compares it with the index: it indexes the files the index does not know (copied into the library without watchman, for example), removes the documents whose file is gone and updates the path of the files that were moved. This also covers webhook calls that never arrived.
+
+`GET /documents?status=failed` → `200 OK`
+
+```json
+{
+  "items": [
+    {
+      "id": "doc_01JB9A7Q5R",
+      "path": "Library/Invoices/2026-03-12-washing-machine.pdf",
+      "collection": "Invoices",
+      "status": "failed",
+      "chunks": 0,
+      "indexed_at": null,
+      "error": "Cannot read the file as pdf: Stream has ended unexpectedly",
+      "attempts": 2,
+      "next_attempt_at": "2026-10-19T18:05:11Z",
+      "url": "https://<host>/f/4190"
+    }
+  ],
+  "total": 1, "limit": 20, "offset": 0
+}
+```
+
+The list is sorted by path. `chunks` is the number of passages in the index, `error` says why the document failed or was skipped, and `attempts` counts the failed attempts since the last success. `GET /documents/{id}` returns one of these objects to any member, or `404`.
+
+`POST /reindex` - request `{ "collection": "Manuals" }` → `202 Accepted`
+
+```json
+{ "job_id": "job_01JB9B7K", "status": "queued", "collection": "Manuals", "requested_by": "carol",
+  "created_at": "2026-10-19T18:10:02Z", "started_at": null, "finished_at": null,
+  "documents": null, "pending": 0, "error": null }
+```
+
+The body is optional: without `collection` the whole library is indexed again. `GET /reindex/{job_id}` returns the same object. When an indexer starts the job (`running`), it first reconciles the index with the library and then queues every document of the collection; `documents` is how many it queued and `pending` how many still wait. The job is `done` once each of them has been tried (some may have `failed`), or `failed`, with the `error`, if the library cannot be listed or there is no such collection.
 
 ### 5.4 observer - usage, quotas and reports
 
@@ -624,8 +664,9 @@ Only months that are over (UTC) have a report: the current month or a later one 
 
 ## 6. Engineering workflow
 
-- **Branching:** trunk-based with short-lived feature branches (`feat/...`, `fix/...`, `docs/...`), squash-merged into a protected `main` through pull requests. Details in [CONTRIBUTING.md](CONTRIBUTING.md).
-- **Commits:** [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`), with service scopes (`feat(watchman): ...`).
+- **Branching:** trunk-based with short-lived feature branches (`feat/...`, `fix/...`, `docs/...`, `build/...`, `ci/...`), squash-merged into a protected `main` through pull requests. Details in [CONTRIBUTING.md](CONTRIBUTING.md).
+- **Commits:** [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`, `build:` for images and compose, `ci:` for the workflow), with service scopes (`feat(watchman): ...`).
+- **Merging:** a pull request can only be merged once the `ci-ok` check of the CI workflow is green (section 9). [PR #24](https://github.com/feglez/AlexandrIA/pull/24) shows it: its lint job failed, the merge button stayed disabled, and it was closed without merging.
 - **User stories:** GitHub Issues created from the [user story template](.github/ISSUE_TEMPLATE/user_story.md), labelled `user-story`, with acceptance criteria and a task checklist, and assigned to a milestone per Hito. The initial backlog is in [`docs/backlog/`](docs/backlog).
 - **Pull requests:** [PR template](.github/PULL_REQUEST_TEMPLATE.md) linking the user story it closes.
 
@@ -660,16 +701,17 @@ The Nextcloud web interface is at <http://localhost:8080>, and the services at `
 |---|---|---|---|---|
 | `postgres` | `pgvector/pgvector:0.8.7-pg17-trixie` | backend | none | One database and one role per component, created by [`01-databases.sh`](compose/postgres/initdb/01-databases.sh) on the first start. No role can connect to another component's database, and only `librarian` has the `vector` extension |
 | `redis` | `redis:8.8.4-alpine` | backend | none | Password protected, with an append-only file so the event stream survives restarts |
-| `nextcloud` | `nextcloud:35.0.3-apache` | frontend, backend | `127.0.0.1:8080` | Installs itself on the first start. Its post-installation hook [`10-alexandria.sh`](compose/nextcloud/hooks/post-installation/10-alexandria.sh) enables the `notifications` and `webhook_listeners` apps, switches background jobs to cron and creates the groups and the accounts (7.5) |
+| `nextcloud` | `nextcloud:35.0.3-apache` | frontend, backend | `127.0.0.1:8080` | Installs itself on the first start. Its post-installation hook [`10-alexandria.sh`](compose/nextcloud/hooks/post-installation/10-alexandria.sh) enables the `notifications` and `webhook_listeners` apps, switches background jobs to cron, lets Nextcloud connect to private addresses (`allow_local_remote_servers`, for the webhook calls to watchman) and creates the groups and the accounts (7.5) |
 | `nextcloud-cron` | `nextcloud:35.0.3-apache` | backend | none | Runs Nextcloud's background jobs every 5 minutes |
-| `bootstrap` | watchman image, `python -m watchman.bootstrap` | backend | none | One-shot job: creates `Library` with one folder per collection and `Quarantine`, shares `Library` read-only with the `members` group and makes `observer` a sub-admin of `members`. It checks what already exists, so it runs on every start |
+| `nextcloud-webhooks` | `nextcloud:35.0.3-apache` | backend | none | Runs Nextcloud's webhook calls (`occ background-job:worker` for the `WebhookCall` jobs) as soon as they are queued, so a file moved or deleted in Nextcloud reaches watchman within seconds instead of at the next cron run |
+| `bootstrap` | watchman image, `python -m watchman.bootstrap` | backend | none | One-shot job: creates `Library` with one folder per collection and `Quarantine`, shares `Library` read-only with the `members` group, makes `observer` a sub-admin of `members` and registers watchman's internal webhook for moved and deleted files, with `WEBHOOK_SECRET`. It checks what already exists, so it runs on every start |
 | `ollama` | `ollama/ollama:0.40.16` | backend, egress | none | LLM runtime (profile `llm`) |
 | `ollama-pull` | `ollama/ollama:0.40.16` | backend | none | One-shot job (profile `llm`): downloads `OLLAMA_MODEL` into the `ollama-models` volume if it is not there yet |
 | `watchman` | built from `services/watchman` | frontend, backend | `127.0.0.1:8081` | Curation workflow |
 | `librarian` | built from `services/librarian` | frontend, backend | `127.0.0.1:8082` | RAG and semantic search |
 | `observer` | built from `services/observer` | frontend, backend | `127.0.0.1:8083` | Usage, quotas and reports |
 
-**Start order and health checks.** Every long-running container has a health check: `pg_isready`, `redis-cli ping`, Nextcloud's `status.php` reporting `"installed":true`, the cron daemon, `ollama list`, and for our services a request to `/healthz` made with Python (the slim images have no curl). `depends_on` with `service_healthy` and `service_completed_successfully` starts PostgreSQL and Redis first, then Nextcloud, and then `bootstrap` and the services (watchman and observer wait until `bootstrap` has finished). Each service applies its database migrations when it starts, under a PostgreSQL advisory lock so that several replicas can start at the same time.
+**Start order and health checks.** Every long-running container has a health check: `pg_isready`, `redis-cli ping`, Nextcloud's `status.php` reporting `"installed":true`, the cron daemon, the webhook worker, `ollama list`, and for our services a request to `/healthz` made with Python (the slim images have no curl). `depends_on` with `service_healthy` and `service_completed_successfully` starts PostgreSQL and Redis first, then Nextcloud, and then `bootstrap` and the services, which wait until `bootstrap` has finished; `nextcloud-webhooks` waits for watchman. Each service applies its database migrations when it starts, under a PostgreSQL advisory lock so that several replicas can start at the same time.
 
 **Ports.** Only container port 8000 (public API) of each service is published. watchman and observer also listen on port 8001 for their internal endpoints (`/internal/*`, section 5), which is never published.
 
@@ -689,8 +731,8 @@ The Nextcloud web interface is at <http://localhost:8080>, and the services at `
 |---|---|---|
 | `postgres-data` | postgres | All the databases |
 | `redis-data` | redis | Append-only file with the event stream |
-| `nextcloud-html` | nextcloud, nextcloud-cron | Nextcloud installation and configuration |
-| `nextcloud-data` | nextcloud, nextcloud-cron | Users' files |
+| `nextcloud-html` | nextcloud, nextcloud-cron, nextcloud-webhooks | Nextcloud installation and configuration |
+| `nextcloud-data` | nextcloud, nextcloud-cron, nextcloud-webhooks | Users' files |
 | `ollama-models` | ollama | Downloaded models |
 
 Compose prefixes them with the project name (`alexandria_postgres-data`, ...). They survive `docker compose down` and are only deleted with `docker compose down -v`. The PostgreSQL init script and the Nextcloud hook only run when their volumes are empty, so after changing either of them, run `docker compose down -v` before the next start.
@@ -703,6 +745,7 @@ Every setting comes from `.env`, a copy of [`.env.example`](.env.example). It on
 - `IMAGE_TAG=dev` makes compose build the service images locally and tag them `ghcr.io/feglez/alexandria-<service>:dev`.
 - `OLLAMA_MODEL` (default `qwen2.5:1.5b`) and `LIBRARY_COLLECTIONS` (the top-level folders of the library).
 - `OBSERVER_INTERNAL_TOKEN`: the token watchman sends with observer's internal quota check (5.4).
+- `WEBHOOK_SECRET`: the secret Nextcloud sends with its webhook calls to watchman's internal port (4.3). `bootstrap` gives it to Nextcloud every time it runs.
 - `MONTHLY_COST_EUR` (default 5.40): the running cost of the platform each month, which observer's report splits among the members (5.4).
 
 Accounts created on the first start, with the passwords from `.env`:
@@ -710,7 +753,7 @@ Accounts created on the first start, with the passwords from `.env`:
 | Account | Groups | Use |
 |---|---|---|
 | `admin` (`NEXTCLOUD_ADMIN_USER`) | admin | Nextcloud administrator |
-| `alexandria` | admin | Service account: owns `Library` and `Quarantine`, sends notifications |
+| `alexandria` | admin | Service account: owns `Library` and `Quarantine`, sends notifications and registers the webhooks. librarian reads the library with it |
 | `observer` | sub-admin of `members` | Reads the members' storage usage |
 | `alice` | members | Demo member |
 | `bob` | members, trusted | Demo member whose submissions the default policy can approve automatically (5.2) |
@@ -720,7 +763,7 @@ Accounts created on the first start, with the passwords from `.env`:
 
 Measured with `docker stats` and `docker images` on amd64:
 
-- **RAM:** about 1.1 GB for everything except Ollama, half of it in librarian, which keeps the embedding model in memory. Ollama with `qwen2.5:1.5b` uses 0.4 to 0.6 GB when idle and about 2.1 GB while it generates an answer, so the whole stack needs about 3.2 GB. On a machine with less memory, use a smaller model such as `qwen2.5:0.5b`.
+- **RAM:** about 1.2 GB for everything except Ollama, half of it in librarian, which keeps the embedding model in memory. Ollama with `qwen2.5:1.5b` uses 0.4 to 0.6 GB when idle and about 2.1 GB while it generates an answer, so the whole stack needs about 3.3 GB. On a machine with less memory, use a smaller model such as `qwen2.5:0.5b`.
 - **Disk:** the Ollama image takes 8.5 GB (a 3.4 GB download, it includes GPU libraries) plus about 1 GB for the model, the Nextcloud image 2.1 GB, and our images the sizes in 8.7.
 
 How to run the linters and the tests is described in [CONTRIBUTING.md](CONTRIBUTING.md#local-development).
@@ -828,7 +871,7 @@ A new push to a pull request cancels the run that was in progress for it. Runs o
 | `lint` | `ruff check` and `ruff format --check` on `services/`, hadolint on the three Dockerfiles, and `docker compose config` with a copy of `.env.example` |
 | `test` | One job per service. It installs the locked dependencies with `uv sync --locked` and runs the unit and integration tests with pytest. PostgreSQL with pgvector and Redis run as service containers, from the same images as in `compose.yaml`. Nextcloud is mocked. librarian's relevance tests search a small library in Spanish and English with the real embedding model, which is downloaded once and then restored from the Actions cache |
 | `build` | One job per service and architecture. It builds the image for `linux/amd64` on an x64 runner and for `linux/arm64` on an Arm runner, with a layer cache per service and architecture. On `main` and on tags it also pushes the image to GHCR by digest, without a tag |
-| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): a curator sets the members' quotas, files are submitted through watchman, a curator approves one (it must appear in the library) and rejects another, the member follows both and gets a Nextcloud notification for each, withdraws a third one, a curator reads the moderation policy and saves it as a new version, a trusted member's file is published without a curator, and while observer is stopped the next one waits for a curator, the member searches the library (the answer's fields, a collection filter and invalid queries), observer adds the published file, the accepted submissions and the searches to the member's usage, only a curator sees everyone's usage, a file over the submitter's quota is rejected, observer's internal port is not published, and a curator gets last month's cost-split report. Each result is checked in Nextcloud, PostgreSQL and Redis |
+| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): a curator sets the members' quotas, files are submitted through watchman, a curator approves one (it must appear in the library) and rejects another, the member follows both and gets a Nextcloud notification for each, withdraws a third one, a curator reads the moderation policy and saves it as a new version, a trusted member's file is published without a curator, and while observer is stopped the next one waits for a curator, the member searches the library (the answer's fields, a collection filter and invalid queries), librarian indexes the published file within 60 seconds of the approval and another member finds it by its meaning, a file in quarantine is not found, a published PDF that cannot be read is listed as `failed` for the curators, observer adds the published file, the accepted submissions and the searches to the member's usage, only a curator sees everyone's usage, a file over the submitter's quota is rejected, observer's internal port is not published, a curator gets last month's cost-split report, and the published file is moved to another collection in Nextcloud (the index follows it), re-indexed by a curator and deleted in Nextcloud (it leaves the index and the member's contribution). Each result is checked in Nextcloud, PostgreSQL and Redis |
 | `publish` | Only on `main` and on tags, once the four jobs above have passed. One job per service: it joins the two images pushed by `build` into one multi-arch image and gives it its tags (9.3) |
 | `ci-ok` | Fails unless every other job succeeded (`publish` is skipped on pull requests). It is the only status check that the `main` ruleset requires, so the ruleset does not depend on the names of the matrix jobs |
 
@@ -852,3 +895,9 @@ The tools have the same pinned versions as in [CONTRIBUTING.md](CONTRIBUTING.md#
 There is no `latest` tag, so whoever runs an image always names the commit or the version. Each tag is a multi-arch manifest for `linux/amd64` and `linux/arm64`: `docker pull` downloads the right image on a PC and on the Raspberry Pi. The images carry the OCI labels generated by `docker/metadata-action` (source repository, revision and version), which link each package to this repository.
 
 To run the local environment with published images instead of building them, set `IMAGE_TAG` in `.env` to one of these tags and run `docker compose pull` (7.5).
+
+### 9.4 Evidence
+
+- [PR #24](https://github.com/feglez/AlexandrIA/pull/24): a failing check (`lint`, and so `ci-ok`) blocks the merge into `main`.
+- [Run 45496534409](https://github.com/feglez/AlexandrIA/actions/runs/45496534409) on `main`: every job green, including the smoke test and the three `publish` jobs. [All the runs on `main`](https://github.com/feglez/AlexandrIA/actions/workflows/ci.yml?query=branch%3Amain).
+- The published images: the package pages linked in 9.3.

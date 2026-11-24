@@ -22,7 +22,7 @@ from ulid import ULID
 from tests import samples
 from tests.conftest import NEXTCLOUD, basic_auth
 from tests.unit.test_files import file_id_answer, multistatus
-from watchman.app import create_public_app
+from watchman.app import create_internal_app, create_public_app
 from watchman.config import Settings
 from watchman.db.migrate import upgrade_database
 from watchman.db.models import Submission
@@ -87,6 +87,7 @@ ALLOWED = {"allowed": True, "remaining_bytes": 4_079_736_799, "remaining_submiss
 # Nextcloud file id of every quarantined file in the mocks.
 FILE_ID = 4182
 NOTIFICATIONS = f"{NEXTCLOUD}/ocs/v2.php/apps/notifications/api/v3/admin_notifications/"
+WEBHOOK_SECRET = "webhook-secret"
 
 
 def nextcloud_user(request: httpx.Request) -> httpx.Response:
@@ -107,6 +108,7 @@ async def resources(migrated_database_url: str, redis_url: str) -> AsyncIterator
         nextcloud_service_password="service-password",
         observer_internal_url=OBSERVER,
         observer_internal_token="observer-token",
+        webhook_secret=WEBHOOK_SECRET,
         events_stream=f"test.events.{ULID()}",
     )
     resources = Resources.from_settings(settings)
@@ -128,6 +130,18 @@ def app(resources: Resources) -> FastAPI:
 async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
+
+
+@pytest.fixture
+async def internal(resources: Resources) -> AsyncIterator[httpx.AsyncClient]:
+    """The internal app, with the webhook secret that Nextcloud sends."""
+    transport = httpx.ASGITransport(app=create_internal_app(resources))
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {WEBHOOK_SECRET}"},
+    ) as client:
         yield client
 
 

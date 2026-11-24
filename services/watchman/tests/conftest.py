@@ -37,4 +37,5 @@ def settings() -> Settings:
         public_base_url="https://alexandria.test",
         nextcloud_service_password="service-password",
         observer_internal_token="observer-token",
+        webhook_secret="webhook-secret",
     )

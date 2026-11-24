@@ -9,6 +9,7 @@ def test_reads_environment_variables(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PUBLIC_PORT", "9000")
     monkeypatch.setenv("NEXTCLOUD_SERVICE_PASSWORD", "service-password")
     monkeypatch.setenv("OBSERVER_INTERNAL_TOKEN", "observer-token")
+    monkeypatch.setenv("WEBHOOK_SECRET", "webhook-secret")
 
     settings = Settings()
 
@@ -33,7 +34,9 @@ def test_service_secrets_are_required(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("REDIS_URL", "redis://redis:6379/1")
     monkeypatch.delenv("NEXTCLOUD_SERVICE_PASSWORD", raising=False)
     monkeypatch.delenv("OBSERVER_INTERNAL_TOKEN", raising=False)
+    monkeypatch.delenv("WEBHOOK_SECRET", raising=False)
 
     with pytest.raises(ValueError, match="nextcloud_service_password") as error:
         Settings()
     assert "observer_internal_token" in str(error.value)
+    assert "webhook_secret" in str(error.value)

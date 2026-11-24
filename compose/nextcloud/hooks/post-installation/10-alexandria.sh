@@ -16,6 +16,10 @@ occ background:cron
 # New accounts start with an empty home folder instead of the sample files.
 occ config:system:set skeletondirectory --value=''
 
+# Webhook calls go to watchman, whose address is a private one: Nextcloud
+# refuses to connect to those unless this is set.
+occ config:system:set allow_local_remote_servers --value=true --type=boolean
+
 for group in members curators trusted; do
     occ group:add "$group"
 done
