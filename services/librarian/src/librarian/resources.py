@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import (
 from librarian.auth import NextcloudAuthenticator
 from librarian.config import Settings
 from librarian.embeddings import Embedder
+from librarian.events import EventPublisher
 
 
 def nextcloud_client(settings: Settings) -> httpx.AsyncClient:
@@ -37,6 +38,7 @@ class Resources:
     nextcloud: httpx.AsyncClient
     authenticator: NextcloudAuthenticator
     embedder: Embedder
+    events: EventPublisher
 
     @classmethod
     def from_settings(cls, settings: Settings, embedder: Embedder) -> "Resources":
@@ -52,6 +54,7 @@ class Resources:
             nextcloud=nextcloud,
             authenticator=NextcloudAuthenticator(nextcloud, redis, settings.auth_cache_seconds),
             embedder=embedder,
+            events=EventPublisher(redis, settings.events_stream),
         )
 
     async def aclose(self) -> None:

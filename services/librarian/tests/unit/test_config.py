@@ -14,6 +14,7 @@ def test_reads_environment_variables(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.public_port == 9000
     assert settings.embedding_model.endswith("paraphrase-multilingual-MiniLM-L12-v2")
     assert settings.curators_group == "curators"
+    assert settings.events_stream == "alexandria.events"
 
 
 def test_database_and_redis_are_required(monkeypatch: pytest.MonkeyPatch) -> None:
