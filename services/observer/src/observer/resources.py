@@ -1,6 +1,7 @@
 """Clients shared by the public and the internal app (one set per process)."""
 
 from dataclasses import dataclass
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 
 import httpx
 from redis.asyncio import Redis
@@ -13,6 +14,17 @@ from sqlalchemy.ext.asyncio import (
 
 from observer.auth import NextcloudAuthenticator
 from observer.config import Settings
+
+
+def nextcloud_client(settings: Settings) -> httpx.AsyncClient:
+    """HTTP client for Nextcloud that never keeps cookies.
+
+    The same client sends the credentials of many users. Nextcloud answers
+    with session cookies, and a request that carried them back would be
+    authenticated as that session's user, whatever credentials it sent.
+    """
+    no_cookies = CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
+    return httpx.AsyncClient(base_url=settings.nextcloud_url, timeout=10.0, cookies=no_cookies)
 
 
 @dataclass
@@ -28,7 +40,7 @@ class Resources:
     def from_settings(cls, settings: Settings) -> "Resources":
         engine = create_async_engine(settings.database_url, pool_pre_ping=True)
         redis = Redis.from_url(settings.redis_url)
-        nextcloud = httpx.AsyncClient(base_url=settings.nextcloud_url, timeout=10.0)
+        nextcloud = nextcloud_client(settings)
         return cls(
             settings=settings,
             engine=engine,

@@ -1,0 +1,23 @@
+{
+  "description": "watchman asks observer whether a member can contribute a file of this size (values from README section 5.4). The token is OBSERVER_INTERNAL_TOKEN.",
+  "request": {
+    "method": "POST",
+    "path": "/internal/quota-checks",
+    "headers": {
+      "Authorization": "Bearer <token>",
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "user": "alice",
+      "size_bytes": 482133
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "allowed": true,
+      "remaining_bytes": 4079736799,
+      "remaining_submissions": 35
+    }
+  }
+}

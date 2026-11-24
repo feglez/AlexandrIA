@@ -231,6 +231,10 @@ jobs:
             echo
           done
 
+      # End-to-end flows through the published ports, with the real Nextcloud.
+      - name: Run the smoke test
+        run: tests/smoke/smoke.sh
+
       - name: Show the containers
         if: always()
         run: docker compose ps --all

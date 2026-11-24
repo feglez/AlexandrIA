@@ -72,7 +72,7 @@ ci: build the arm64 images on a native runner
 
 **Tools:** Docker with Docker Compose, and [uv](https://docs.astral.sh/uv/) for the Python projects. The lock files were made with uv 0.13.9, the version used to build the images; after adding or updating a dependency, relock with that version so that `uv sync --locked` keeps working in the Dockerfiles.
 
-**Layout:** each service under `services/` is an independent uv project with its own `pyproject.toml`, `uv.lock`, Dockerfile and tests. Some modules are copies in the three services (`config.py`, `problems.py`, `auth.py`, `resources.py`, `db/` and the tests' `conftest.py`), so a fix in one of them must be applied to the three.
+**Layout:** each service under `services/` is an independent uv project with its own `pyproject.toml`, `uv.lock`, Dockerfile and tests. Some modules are copies in the three services (`config.py`, `problems.py`, `auth.py`, `resources.py`, `db/` and the tests' `conftest.py`), so a fix in one of them must be applied to the three. A service may add its own settings and clients to them (watchman has the WebDAV, quota and event clients); only the shared part is the same everywhere.
 
 **Whole platform:** `cp .env.example .env && docker compose up -d --wait`. See [README section 7](README.md#7-local-environment).
 
@@ -101,4 +101,8 @@ docker stop test-pg test-redis
 
 Without `TEST_DATABASE_URL` and `TEST_REDIS_URL` the integration tests are skipped (they fail instead when the `CI` variable is set). Each run recreates the database `test_<service>`. Nextcloud is never called for real in these tests: its answers are mocked with respx.
 
-**CI** runs the same linters and tests, with the same tool versions, on every pull request. It also builds the images for amd64 and arm64 and starts the compose stack (see [README section 9](README.md#9-continuous-integration)).
+**Smoke test.** With the stack running (`docker compose up -d --wait`), `tests/smoke/smoke.sh` tries the main flow through the published ports, with the real Nextcloud. It reads the passwords from `.env` and needs curl and jq. It submits new content on every run, so it can run again on the same volumes.
+
+**Contracts.** [`contracts/`](contracts) holds the example requests and answers of the internal calls between services. Both sides test against the same file.
+
+**CI** runs the same linters and tests, with the same tool versions, on every pull request. It also builds the images for amd64 and arm64, starts the compose stack and runs the smoke test (see [README section 9](README.md#9-continuous-integration)).

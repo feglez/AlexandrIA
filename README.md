@@ -258,7 +258,7 @@ flowchart TB
 
 Nextcloud delivers webhooks from background jobs (every ~5 minutes with cron, or in near real time with a dedicated background-job worker). The main flow does not depend on them: publications are events emitted by watchman itself.
 
-**Event envelope** (one stream, `alexandria.events`):
+**Event envelope** (one stream, `alexandria.events`; each stream entry holds the envelope as JSON in a field named `event`):
 
 ```json
 {
@@ -388,6 +388,10 @@ The platform runs on a **Raspberry Pi 4 Model B (8 GB)** with a **USB SSD** for 
   "created_at": "2026-10-19T17:42:10Z"
 }
 ```
+
+Each check gives `pass` or `fail`. The quota check can also be `unavailable` (observer did not answer in time, so the submission waits for a curator and is never approved automatically) or `skipped` (another check already failed). When a check fails, the submission is stored as `rejected` and the answer is `422` with its `submission_id`, the `checks` and a machine-readable `reason`. If several checks fail, the reason is the first one in this list: `file_too_large`, `blocked_type`, `mime_mismatch` (the content does not match the extension), `duplicate` (with `existing_path`), `quota_exceeded`. A request whose `Content-Length` is far over the size limit gets `413` before its body is read.
+
+`GET /collections` → `200 OK`: `{ "items": [{ "name": "Manuals", "path": "Library/Manuals" }, ...], "total": 6 }`
 
 `POST /submissions/{id}/reject` - request:
 
@@ -553,7 +557,7 @@ docker compose ps
 | `docker compose build` | Rebuilds the service images after a code change (the dependency layer stays cached, see 8.3) |
 | `COMPOSE_PROFILES= docker compose up -d --wait` | Starts everything except Ollama (see 7.5) |
 
-The Nextcloud web interface is at <http://localhost:8080>, and the services at `http://localhost:8081` (watchman), `:8082` (librarian) and `:8083` (observer). At this stage the services only answer `GET /healthz`; the endpoints of section 5 arrive with their user stories.
+The Nextcloud web interface is at <http://localhost:8080>, and the services at `http://localhost:8081` (watchman), `:8082` (librarian) and `:8083` (observer). The endpoints of section 5 are added with their user stories, and [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh) tries them against the running stack.
 
 ### 7.2 Containers
 
@@ -603,6 +607,7 @@ Every setting comes from `.env`, a copy of [`.env.example`](.env.example). It on
 - `COMPOSE_PROFILES=llm` includes Ollama in the default start. To run without the language model, use `COMPOSE_PROFILES= docker compose up -d --wait` or leave the variable empty in `.env`. librarian starts anyway, because its dependency on `ollama-pull` is marked `required: false`.
 - `IMAGE_TAG=dev` makes compose build the service images locally and tag them `ghcr.io/feglez/alexandria-<service>:dev`.
 - `OLLAMA_MODEL` (default `qwen2.5:1.5b`) and `LIBRARY_COLLECTIONS` (the top-level folders of the library).
+- `OBSERVER_INTERNAL_TOKEN`: the token watchman sends with observer's internal quota check (5.4).
 
 Accounts created on the first start, with the passwords from `.env`:
 
@@ -726,7 +731,7 @@ A new push to a pull request cancels the run that was in progress for it. Runs o
 | `lint` | `ruff check` and `ruff format --check` on `services/`, hadolint on the three Dockerfiles, and `docker compose config` with a copy of `.env.example` |
 | `test` | One job per service. It installs the locked dependencies with `uv sync --locked` and runs the unit and integration tests with pytest. PostgreSQL with pgvector and Redis run as service containers, from the same images as in `compose.yaml`. Nextcloud is mocked |
 | `build` | One job per service and architecture. It builds the image for `linux/amd64` on an x64 runner and for `linux/arm64` on an Arm runner, with a layer cache per service and architecture. On `main` and on tags it also pushes the image to GHCR by digest, without a tag |
-| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports |
+| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): files are submitted through watchman and the result is checked in Nextcloud, PostgreSQL and Redis |
 | `publish` | Only on `main` and on tags, once the four jobs above have passed. One job per service: it joins the two images pushed by `build` into one multi-arch image and gives it its tags (9.3) |
 | `ci-ok` | Fails unless every other job succeeded (`publish` is skipped on pull requests). It is the only status check that the `main` ruleset requires, so the ruleset does not depend on the names of the matrix jobs |
 
