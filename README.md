@@ -281,6 +281,17 @@ Nextcloud delivers webhooks from background jobs (every ~5 minutes with cron, or
 
 watchman emits `file.published` once the file is in the library, with the curator who approved it as `actor` (`watchman` when the moderation policy approved it automatically). `submission.decided` has the curator as `actor`, and its `data` holds `submission_id`, `decision` (`approved` or `rejected`), `reason`, `filename`, `collection` and `submitted_by`.
 
+observer reads the stream in its own consumer group and records the usage of each member per month (UTC, from `occurred_at`):
+
+| Event | Member | Counts |
+|---|---|---|
+| `file.published` | `data.submitted_by` (never the `actor`) | Adds `data.size_bytes` to the member's library contribution |
+| `file.removed` | `data.submitted_by` | Takes `data.size_bytes` away from it |
+| `submission.created` | `data.submitted_by` | One submission, unless its `status` is `rejected`: a file rejected by the checks never reaches the library |
+| `search.performed`, `question.answered` | `actor`, the member who asked | One search or one question |
+
+Delivery is at least once, so observer stores the `id` of every event it counts and counts each one only once. An entry that an observer replica received but did not acknowledge (it stopped, or its database failed) is taken again a minute later by any replica.
+
 ### 4.4 Main flow: from submission to answer
 
 ```mermaid
@@ -525,7 +536,7 @@ Each `PUT` stores a new version with the curator who saved it, and the latest ve
 | Method | Route | Role | Description |
 |---|---|---|---|
 | `GET` | `/usage/me` | member | My personal storage, library contributions, submissions, searches and questions this month, remaining quota |
-| `GET` | `/usage` | curator | Usage of every member. Query: `period=YYYY-MM` |
+| `GET` | `/usage` | curator | Usage of every member in a month. Query: `period=YYYY-MM` (default: this month), `limit`, `offset` |
 | `GET` | `/quotas/{user}` | self / curator | Contribution quota of a member |
 | `PUT` | `/quotas/{user}` | curator | Set a member's contribution quota |
 | `GET` | `/reports/{period}` | curator | Monthly cost-split report (`period=YYYY-MM`) |
@@ -542,6 +553,28 @@ Each `PUT` stores a new version with the curator who saved it, and the latest ve
   "submissions": { "this_period": 14, "limit": 50 },
   "searches": { "this_period": 230 },
   "questions": { "this_period": 12 }
+}
+```
+
+`period` is the current month (UTC). `personal_storage` comes from Nextcloud (`/cloud/users/{user}`, read with the `observer` account): `quota_bytes` is `null` when the member has no limit in Nextcloud, and `personal_storage` is `null` when Nextcloud does not answer. `library_contribution.used_bytes` is the size of the member's files in the library (published minus removed), and the other figures count the events of this month (4.3); they follow the events within seconds. The quotas are the default ones: 5 GiB of contributions and 50 submissions a month (settings `DEFAULT_MAX_CONTRIBUTION_BYTES` and `DEFAULT_MAX_SUBMISSIONS_PER_MONTH`).
+
+`GET /usage?period=2026-10` → `200 OK`: the list format of section 5.1 plus the `period`, with one item for each member who has any usage up to that month, ordered by user name. Each item is like the `GET /usage/me` answer without `period` and `personal_storage`, and its `library_contribution.used_bytes` is the contribution at the end of the month.
+
+```json
+{
+  "period": "2026-10",
+  "items": [
+    {
+      "user": "alice",
+      "library_contribution": { "used_bytes": 1288490188, "quota_bytes": 5368709120 },
+      "submissions": { "this_period": 14, "limit": 50 },
+      "searches": { "this_period": 230 },
+      "questions": { "this_period": 12 }
+    }
+  ],
+  "total": 1,
+  "limit": 20,
+  "offset": 0
 }
 ```
 
@@ -778,7 +811,7 @@ A new push to a pull request cancels the run that was in progress for it. Runs o
 | `lint` | `ruff check` and `ruff format --check` on `services/`, hadolint on the three Dockerfiles, and `docker compose config` with a copy of `.env.example` |
 | `test` | One job per service. It installs the locked dependencies with `uv sync --locked` and runs the unit and integration tests with pytest. PostgreSQL with pgvector and Redis run as service containers, from the same images as in `compose.yaml`. Nextcloud is mocked |
 | `build` | One job per service and architecture. It builds the image for `linux/amd64` on an x64 runner and for `linux/arm64` on an Arm runner, with a layer cache per service and architecture. On `main` and on tags it also pushes the image to GHCR by digest, without a tag |
-| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): files are submitted through watchman, a curator approves one (it must appear in the library) and rejects another, the member follows both and gets a Nextcloud notification for each, withdraws a third one, a curator reads the moderation policy and saves it as a new version, and each result is checked in Nextcloud, PostgreSQL and Redis |
+| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): files are submitted through watchman, a curator approves one (it must appear in the library) and rejects another, the member follows both and gets a Nextcloud notification for each, withdraws a third one, a curator reads the moderation policy and saves it as a new version, observer adds the published file and the accepted submissions to the member's usage, only a curator sees everyone's usage, and each result is checked in Nextcloud, PostgreSQL and Redis |
 | `publish` | Only on `main` and on tags, once the four jobs above have passed. One job per service: it joins the two images pushed by `build` into one multi-arch image and gives it its tags (9.3) |
 | `ci-ok` | Fails unless every other job succeeded (`publish` is skipped on pull requests). It is the only status check that the `main` ruleset requires, so the ruleset does not depend on the names of the matrix jobs |
 
