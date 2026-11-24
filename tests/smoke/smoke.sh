@@ -18,6 +18,7 @@ set +a
 
 NEXTCLOUD_URL=${SMOKE_NEXTCLOUD_URL:-http://127.0.0.1:8080}
 WATCHMAN_URL=${SMOKE_WATCHMAN_URL:-http://127.0.0.1:8081}
+OBSERVER_URL=${SMOKE_OBSERVER_URL:-http://127.0.0.1:8083}
 ALICE="alice:${DEMO_ALICE_PASSWORD}"
 BOB="bob:${DEMO_BOB_PASSWORD}"
 CAROL="carol:${DEMO_CAROL_PASSWORD}"
@@ -69,11 +70,48 @@ notified() {
     jq -er --arg subject "$2" '.ocs.data[] | select(.subject == $subject) | .message' "$body"
 }
 
+# drained: wait until observer has handled every event in the stream (nothing
+# left to read and nothing unacknowledged in its consumer group).
+drained() {
+    local left
+    for _ in $(seq 60); do
+        left=$(docker compose exec -T redis redis-cli -n 1 --raw XINFO GROUPS alexandria.events |
+            paste - - | awk -F '\t' '
+                $1 == "name" { group = $2 }
+                group == "observer" && ($1 == "pending" || $1 == "lag") {
+                    if ($2 !~ /^[0-9]+$/) bad = 1
+                    left += $2; seen++
+                }
+                END { print (seen == 2 && !bad ? left : "unknown") }') || left=unknown
+        [[ $left == 0 ]] && return
+        sleep 1
+    done
+    fail "observer has not handled every event after 60 s ($left left)"
+}
+
+# usage CREDENTIALS: the member's usage from observer, in $body.
+usage() { expect 200 -u "$1" "$OBSERVER_URL/api/v1/usage/me"; }
+
 run_id="$(date -u +%Y%m%d%H%M%S)-$RANDOM$RANDOM"
 
 step "watchman lists the library collections"
 expect 200 -u "$ALICE" "$WATCHMAN_URL/api/v1/collections"
 field '.items[].name' | grep -qx Manuals || fail "Manuals is not a collection"
+
+# Earlier runs on the same volumes count too: the checks below compare with
+# these figures.
+step "observer reports alice's usage"
+drained
+usage "$ALICE"
+[[ $(field .user) == alice ]] || fail "user is not alice"
+[[ $(field .period) == "$(date -u +%Y-%m)" ]] || fail "period is not this month"
+contributed=$(field .library_contribution.used_bytes)
+submitted=$(field .submissions.this_period)
+storage=$(field .personal_storage.used_bytes)
+expect 200 -u "$ALICE" -H "OCS-APIRequest: true" \
+    "$NEXTCLOUD_URL/ocs/v2.php/cloud/users/alice?format=json"
+[[ $(field .ocs.data.quota.used) == "$storage" ]] ||
+    fail "personal storage is $storage bytes, Nextcloud says $(field .ocs.data.quota.used)"
 
 step "alice submits a file"
 name="smoke-$run_id.md"
@@ -163,6 +201,13 @@ message=$(notified "$ALICE" "Your file $name is in the library")
 step "file.published was published"
 docker compose exec -T redis redis-cli -n 1 --raw XREVRANGE alexandria.events + - COUNT 50 |
     grep -F "\"$id\"" | grep -q '"file.published"' || fail "no file.published for $id"
+
+step "observer adds the published file to alice's contribution"
+drained
+usage "$ALICE"
+size=$(wc -c < "$work/$name")
+[[ $(field .library_contribution.used_bytes) == $((contributed + size)) ]] ||
+    fail "contribution is not $((contributed + size)) bytes"
 
 step "The same content again is a duplicate"
 cp "$work/$name" "$work/copy-$name"
@@ -266,6 +311,27 @@ expect 422 -u "$ALICE" -F "file=@$work/fake.pdf" -F collection=Manuals \
     "$WATCHMAN_URL/api/v1/submissions"
 [[ $(field .reason) == mime_mismatch ]] || fail "reason is not mime_mismatch"
 field .submission_id > /dev/null
+
+# Accepted: the published, the rejected and the withdrawn file. The duplicate
+# and the file whose content does not match were rejected by the checks.
+step "observer counts alice's accepted submissions"
+drained
+usage "$ALICE"
+[[ $(field .submissions.this_period) == $((submitted + 3)) ]] ||
+    fail "submissions this month are not $((submitted + 3))"
+
+step "Members cannot see the usage of others"
+expect 403 -u "$BOB" "$OBSERVER_URL/api/v1/usage"
+expect 401 "$OBSERVER_URL/api/v1/usage/me"
+
+step "carol sees the usage of every member"
+expect 200 -u "$CAROL" "$OBSERVER_URL/api/v1/usage?limit=100"
+[[ $(field .period) == "$(date -u +%Y-%m)" ]] || fail "period is not this month"
+[[ $(field '.items[] | select(.user == "alice") | .library_contribution.used_bytes') == \
+    $((contributed + size)) ]] || fail "alice's contribution is not $((contributed + size)) bytes"
+field '.items[] | select(.user == "bob") | .submissions.this_period' > /dev/null ||
+    fail "bob is not in the list"
+expect 422 -u "$CAROL" "$OBSERVER_URL/api/v1/usage?period=2026-13"
 
 step "Submissions without credentials are rejected"
 expect 401 -F "file=@$work/$name" -F collection=Manuals "$WATCHMAN_URL/api/v1/submissions"
