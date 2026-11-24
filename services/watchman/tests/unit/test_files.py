@@ -23,6 +23,16 @@ def multistatus(*hrefs: str) -> str:
     )
 
 
+def file_id_answer(href: str, file_id: int) -> str:
+    """PROPFIND answer with the oc:fileid of one file."""
+    return (
+        '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
+        f"<d:response><d:href>{href}</d:href><d:propstat><d:prop><oc:fileid>{file_id}"
+        "</oc:fileid></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+        "</d:multistatus>"
+    )
+
+
 @pytest.fixture
 async def files():
     async with httpx.AsyncClient(base_url=NEXTCLOUD) as client:
@@ -101,3 +111,61 @@ async def test_delete_ignores_missing_files(files: NextcloudFiles) -> None:
     respx.delete(f"{ROOT}/Quarantine/sub_1").respond(404)
 
     await files.delete("Quarantine/sub_1")
+
+
+@respx.mock
+async def test_file_id(files: NextcloudFiles) -> None:
+    href = "/remote.php/dav/files/alexandria/Quarantine/sub_1/a%20b.pdf"
+    route = respx.request("PROPFIND", f"{ROOT}/Quarantine/sub_1/a%20b.pdf").respond(
+        207, text=file_id_answer(href, 4182)
+    )
+
+    assert await files.file_id("Quarantine/sub_1/a b.pdf") == 4182
+    sent = route.calls.last.request
+    assert sent.headers["Depth"] == "0"
+    assert b"<oc:fileid/>" in sent.content
+
+
+@respx.mock
+async def test_file_id_of_a_missing_file(files: NextcloudFiles) -> None:
+    respx.request("PROPFIND", f"{ROOT}/Library/Manuals/a.pdf").respond(404)
+
+    assert await files.file_id("Library/Manuals/a.pdf") is None
+
+
+@pytest.mark.parametrize(
+    ("status", "text"),
+    [(500, ""), (207, multistatus("/remote.php/dav/files/alexandria/a.pdf"))],
+    ids=["error", "no-file-id"],
+)
+async def test_file_id_errors(files: NextcloudFiles, status: int, text: str) -> None:
+    with respx.mock:
+        respx.request("PROPFIND", f"{ROOT}/a.pdf").respond(status, text=text)
+        with pytest.raises(FilesError):
+            await files.file_id("a.pdf")
+
+
+@respx.mock
+async def test_move_never_overwrites(files: NextcloudFiles) -> None:
+    route = respx.request("MOVE", f"{ROOT}/Quarantine/sub_1/Garant%C3%ADa.pdf").respond(201)
+
+    assert await files.move("Quarantine/sub_1/Garantía.pdf", "Library/Manuals/Garantía.pdf")
+    sent = route.calls.last.request
+    assert sent.headers["Destination"] == f"{ROOT}/Library/Manuals/Garant%C3%ADa.pdf"
+    assert sent.headers["Overwrite"] == "F"
+    assert sent.headers["Authorization"] == basic_auth("alexandria", "service-password")
+
+
+@respx.mock
+async def test_move_when_the_target_exists(files: NextcloudFiles) -> None:
+    respx.request("MOVE", f"{ROOT}/Quarantine/sub_1/a.pdf").respond(412)
+
+    assert not await files.move("Quarantine/sub_1/a.pdf", "Library/Manuals/a.pdf")
+
+
+@pytest.mark.parametrize("status", [404, 409, 423, 503])
+async def test_move_errors(files: NextcloudFiles, status: int) -> None:
+    with respx.mock:
+        respx.request("MOVE", f"{ROOT}/Quarantine/sub_1/a.pdf").respond(status)
+        with pytest.raises(FilesError, match=f"HTTP {status}"):
+            await files.move("Quarantine/sub_1/a.pdf", "Library/Manuals/a.pdf")

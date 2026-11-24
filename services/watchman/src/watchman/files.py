@@ -16,9 +16,15 @@ import httpx
 logger = logging.getLogger(__name__)
 
 DAV = "{DAV:}"
+OC = "{http://owncloud.org/ns}"
 PROPFIND_BODY = (
     '<?xml version="1.0"?>'
     '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
+)
+FILE_ID_BODY = (
+    '<?xml version="1.0"?>'
+    '<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
+    "<d:prop><oc:fileid/></d:prop></d:propfind>"
 )
 UPLOAD_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
 
@@ -57,6 +63,42 @@ class NextcloudFiles:
                 continue
             names.append(href.rsplit("/", 1)[-1])
         return sorted(names)
+
+    async def file_id(self, path: str) -> int | None:
+        """Nextcloud's id of the file at `path`, or None if there is no such file.
+
+        The id stays the same when the file is moved.
+        """
+        response = await self._request(
+            "PROPFIND",
+            path,
+            content=FILE_ID_BODY,
+            headers={"Depth": "0", "Content-Type": "application/xml"},
+        )
+        if response.status_code == 404:
+            return None
+        if response.status_code != 207:
+            raise FilesError(f"PROPFIND {path}: HTTP {response.status_code}")
+        root = ElementTree.fromstring(response.content)  # noqa: S314 - see list_folders
+        value = root.findtext(f".//{OC}fileid", "")
+        if not value.isdigit():
+            raise FilesError(f"PROPFIND {path}: no file id in the answer")
+        return int(value)
+
+    async def move(self, source: str, target: str) -> bool:
+        """Move a file on the server without overwriting anything.
+
+        Returns False, and moves nothing, if `target` already exists.
+        """
+        destination = str(self._client.base_url).rstrip("/") + self.url(target)
+        response = await self._request(
+            "MOVE", source, headers={"Destination": destination, "Overwrite": "F"}
+        )
+        if response.status_code == 412:
+            return False
+        if response.status_code not in (201, 204):
+            raise FilesError(f"MOVE {source} to {target}: HTTP {response.status_code}")
+        return True
 
     async def make_folder(self, path: str) -> None:
         response = await self._request("MKCOL", path)

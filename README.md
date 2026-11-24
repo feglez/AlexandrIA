@@ -269,13 +269,17 @@ Nextcloud delivers webhooks from background jobs (every ~5 minutes with cron, or
   "data": {
     "submission_id": "sub_01JB8Z5Y0F",
     "path": "Library/Manuals/washing-machine-warranty.pdf",
+    "collection": "Manuals",
     "file_id": 4182,
     "size_bytes": 482133,
+    "mime_type": "application/pdf",
     "sha256": "9f2c1e...",
     "submitted_by": "alice"
   }
 }
 ```
+
+watchman emits `file.published` once the file is in the library, with the curator who approved it as `actor`. `submission.decided` has the curator as `actor`, and its `data` holds `submission_id`, `decision` (`approved` or `rejected`), `reason`, `filename`, `collection` and `submitted_by`.
 
 ### 4.4 Main flow: from submission to answer
 
@@ -393,11 +397,17 @@ Each check gives `pass` or `fail`. The quota check can also be `unavailable` (ob
 
 `GET /collections` → `200 OK`: `{ "items": [{ "name": "Manuals", "path": "Library/Manuals" }, ...], "total": 6 }`
 
+`GET /submissions` → `200 OK`: the list format of section 5.1, newest first, each item like the `POST /submissions` answer. `?status=pending_review` gives the submissions waiting for a curator.
+
+`POST /submissions/{id}/approve` → `200 OK` with the submission, now `approved`. watchman then moves the file in the background with WebDAV `MOVE` into `Library/<collection>/`, never overwriting a file: if the name is taken, it adds ` (2)`, ` (3)`, ... before the extension. It records the file, sets the status to `published` and emits `file.published`. A failed move is retried with growing pauses; after 5 attempts the submission is `failed`, and approving it again starts over.
+
 `POST /submissions/{id}/reject` - request:
 
 ```json
 { "reason": "Scanned upside down, please rescan." }
 ```
+
+→ `200 OK` with the submission, now `rejected`, or `422` without a reason. Both decisions are stored in the status history with the curator and the time. A decision that the life cycle of section 1.5 does not allow (for example, approving a rejected submission) gets `409` with the submission's `current_status`.
 
 `PUT /policies` - request:
 
@@ -731,7 +741,7 @@ A new push to a pull request cancels the run that was in progress for it. Runs o
 | `lint` | `ruff check` and `ruff format --check` on `services/`, hadolint on the three Dockerfiles, and `docker compose config` with a copy of `.env.example` |
 | `test` | One job per service. It installs the locked dependencies with `uv sync --locked` and runs the unit and integration tests with pytest. PostgreSQL with pgvector and Redis run as service containers, from the same images as in `compose.yaml`. Nextcloud is mocked |
 | `build` | One job per service and architecture. It builds the image for `linux/amd64` on an x64 runner and for `linux/arm64` on an Arm runner, with a layer cache per service and architecture. On `main` and on tags it also pushes the image to GHCR by digest, without a tag |
-| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): files are submitted through watchman and the result is checked in Nextcloud, PostgreSQL and Redis |
+| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): files are submitted through watchman, a curator approves one (it must appear in the library) and rejects another, and each result is checked in Nextcloud, PostgreSQL and Redis |
 | `publish` | Only on `main` and on tags, once the four jobs above have passed. One job per service: it joins the two images pushed by `build` into one multi-arch image and gives it its tags (9.3) |
 | `ci-ok` | Fails unless every other job succeeded (`publish` is skipped on pull requests). It is the only status check that the `main` ruleset requires, so the ruleset does not depend on the names of the matrix jobs |
 

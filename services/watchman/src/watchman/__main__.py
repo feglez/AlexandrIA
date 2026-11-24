@@ -2,7 +2,8 @@
 
 1. Apply the database migrations.
 2. Serve the public API (PUBLIC_PORT) and the internal API (INTERNAL_PORT)
-   from the same process. Scaling is done by running more containers.
+   from the same process, and run the mover that publishes approved
+   submissions. Scaling is done by running more containers.
 """
 
 import asyncio
@@ -16,6 +17,7 @@ import uvicorn
 from watchman.app import create_internal_app, create_public_app
 from watchman.config import Settings
 from watchman.db.migrate import upgrade_database
+from watchman.mover import Mover
 from watchman.resources import Resources
 
 logger = logging.getLogger("watchman")
@@ -58,9 +60,13 @@ async def serve(settings: Settings) -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop)
+    mover = asyncio.create_task(Mover(resources).run(), name="mover")
     try:
         await asyncio.gather(*(server.serve() for server in servers))
     finally:
+        mover.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await mover
         await resources.aclose()
 
 

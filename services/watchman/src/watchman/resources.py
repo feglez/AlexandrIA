@@ -1,6 +1,7 @@
 """Clients shared by the public and the internal app (one set per process)."""
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 
 import httpx
@@ -42,6 +43,8 @@ class Resources:
     observer: httpx.AsyncClient
     quota: QuotaClient
     events: EventPublisher
+    # Set after an approval, so the mover does not wait for its next poll.
+    mover_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Resources":
