@@ -19,12 +19,13 @@ async def test_service_reaches_postgres_and_redis(
         database_url=migrated_database_url,
         redis_url=redis_url,
         nextcloud_observer_password="observer-password",
+        observer_internal_token="observer-token",
     )
     resources = Resources.from_settings(settings)
     try:
         async with resources.engine.connect() as connection:
             revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
-        assert revision == "0002"
+        assert revision == "0003"
         assert await resources.redis.ping()
 
         transport = httpx.ASGITransport(app=create_public_app(resources))

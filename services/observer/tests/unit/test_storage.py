@@ -91,3 +91,61 @@ async def test_nextcloud_down_gives_nothing(storage: NextcloudStorage) -> None:
     respx.get(ALICE_URL).mock(side_effect=httpx.ConnectError("refused"))
 
     assert await storage.usage("alice") is None
+
+
+MEMBERS_URL = f"{NEXTCLOUD}/ocs/v2.php/cloud/groups/members/users"
+
+
+def group(users: object) -> dict:
+    return {"ocs": {"meta": {"statuscode": 200}, "data": {"users": users}}}
+
+
+@respx.mock
+async def test_lists_the_members(storage: NextcloudStorage) -> None:
+    # As Nextcloud 35.0.3 answered to the observer account.
+    route = respx.get(MEMBERS_URL).respond(json=group(["alice", "bob", "carol"]))
+
+    assert await storage.members("members") == ["alice", "bob", "carol"]
+    sent = route.calls.last.request
+    assert sent.url.params["format"] == "json"
+    assert sent.headers["OCS-APIRequest"] == "true"
+    assert sent.headers["Authorization"] == basic_auth("observer", "observer-password")
+
+
+@respx.mock
+async def test_the_group_name_is_quoted(storage: NextcloudStorage) -> None:
+    route = respx.get(f"{NEXTCLOUD}/ocs/v2.php/cloud/groups/la%20casa%2F1/users").respond(
+        json=group([])
+    )
+
+    assert await storage.members("la casa/1") == []
+    assert route.called
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        # Not a sub-admin of the group.
+        httpx.Response(403, json={"ocs": {"meta": {"statuscode": 403}, "data": []}}),
+        httpx.Response(401),
+        httpx.Response(200, text="<html>maintenance</html>"),
+        httpx.Response(200, json={"ocs": {"meta": {"statuscode": 200}, "data": []}}),
+        httpx.Response(200, json=group({"alice": "alice"})),
+        httpx.Response(200, json=group(["alice", 7])),
+        httpx.Response(200, json=group(["alice", ""])),
+    ],
+)
+@respx.mock
+async def test_unexpected_member_lists_give_nothing(
+    storage: NextcloudStorage, answer: httpx.Response
+) -> None:
+    respx.get(MEMBERS_URL).mock(return_value=answer)
+
+    assert await storage.members("members") is None
+
+
+@respx.mock
+async def test_nextcloud_down_gives_no_members(storage: NextcloudStorage) -> None:
+    respx.get(MEMBERS_URL).mock(side_effect=httpx.ConnectError("refused"))
+
+    assert await storage.members("members") is None

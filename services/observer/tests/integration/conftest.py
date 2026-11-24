@@ -20,11 +20,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 from ulid import ULID
 
-from observer.app import create_public_app
+from observer.app import create_internal_app, create_public_app
 from observer.config import Settings
 from observer.consumer import EventConsumer
 from observer.db.migrate import upgrade_database
-from observer.db.models import UsageTotal
+from observer.db.models import StorageSnapshot, UsageTotal
 from observer.resources import Resources
 from tests.conftest import NEXTCLOUD, basic_auth
 
@@ -74,7 +74,9 @@ BOB = ("bob", "bob-app-password")
 CAROL = ("carol", "carol-app-password")
 GROUPS = {"alice": ["members"], "bob": ["members"], "carol": ["members", "curators"]}
 OBSERVER_ACCOUNT = ("observer", "observer-password")
+TOKEN = "observer-token"
 USERS = f"{NEXTCLOUD}/ocs/v2.php/cloud/users/"
+MEMBERS = f"{NEXTCLOUD}/ocs/v2.php/cloud/groups/members/users"
 # Personal storage of each member, as Nextcloud reports it (-3: no quota).
 STORAGE = {
     "alice": {"free": -3, "used": 8_321_499_136, "total": -3, "relative": 0, "quota": -3},
@@ -96,6 +98,14 @@ def nextcloud_user(request: httpx.Request) -> httpx.Response:
     return httpx.Response(401)
 
 
+def nextcloud_members(request: httpx.Request) -> httpx.Response:
+    # Of the three members, only alice's and bob's storage can be read (STORAGE).
+    if request.headers.get("Authorization") != basic_auth(*OBSERVER_ACCOUNT):
+        return httpx.Response(401)
+    data = {"users": ["alice", "bob", "carol"]}
+    return httpx.Response(200, json={"ocs": {"meta": {"statuscode": 200}, "data": data}})
+
+
 def nextcloud_user_details(request: httpx.Request) -> httpx.Response:
     if request.headers.get("Authorization") != basic_auth(*OBSERVER_ACCOUNT):
         return httpx.Response(401)
@@ -114,11 +124,14 @@ async def resources(migrated_database_url: str, redis_url: str) -> AsyncIterator
         nextcloud_url=NEXTCLOUD,
         public_base_url="https://alexandria.test",
         nextcloud_observer_password=OBSERVER_ACCOUNT[1],
+        observer_internal_token=TOKEN,
         events_stream=f"test.events.{ULID()}",
     )
     resources = Resources.from_settings(settings)
     async with resources.engine.begin() as connection:
-        await connection.execute(text("TRUNCATE usage_events, usage_totals"))
+        await connection.execute(
+            text("TRUNCATE usage_events, usage_totals, quotas, storage_snapshots")
+        )
     yield resources
     await resources.redis.delete(settings.events_stream)
     await resources.aclose()
@@ -137,12 +150,24 @@ async def client(resources: Resources) -> AsyncIterator[httpx.AsyncClient]:
 
 
 @pytest.fixture
+async def internal(resources: Resources) -> AsyncIterator[httpx.AsyncClient]:
+    """Client of the internal app, sending watchman's token."""
+    transport = httpx.ASGITransport(app=create_internal_app(resources))
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers=headers
+    ) as client:
+        yield client
+
+
+@pytest.fixture
 def mocked() -> Iterator[respx.MockRouter]:
     with respx.mock(assert_all_called=False) as router:
         router.get(f"{NEXTCLOUD}/ocs/v2.php/cloud/user", name="auth").mock(
             side_effect=nextcloud_user
         )
         router.get(url__startswith=USERS, name="storage").mock(side_effect=nextcloud_user_details)
+        router.get(MEMBERS, name="members").mock(side_effect=nextcloud_members)
         yield router
 
 
@@ -217,3 +242,18 @@ async def totals(resources: Resources) -> dict[tuple[str, str], tuple[int, int, 
             )
             for row in rows
         }
+
+
+async def snapshot(resources: Resources, member: str, used_bytes: int, taken_at: datetime) -> None:
+    """Store a snapshot of the member's personal storage."""
+    async with resources.sessions.begin() as session:
+        session.add(StorageSnapshot(member=member, taken_at=taken_at, used_bytes=used_bytes))
+
+
+async def snapshots(resources: Resources) -> list[tuple[str, int]]:
+    """(member, used_bytes) of every snapshot, by member and time."""
+    async with resources.sessions() as session:
+        rows = await session.scalars(
+            select(StorageSnapshot).order_by(StorageSnapshot.member, StorageSnapshot.taken_at)
+        )
+        return [(row.member, row.used_bytes) for row in rows]
