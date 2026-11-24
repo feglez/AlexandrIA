@@ -279,7 +279,7 @@ Nextcloud delivers webhooks from background jobs (every ~5 minutes with cron, or
 }
 ```
 
-watchman emits `file.published` once the file is in the library, with the curator who approved it as `actor`. `submission.decided` has the curator as `actor`, and its `data` holds `submission_id`, `decision` (`approved` or `rejected`), `reason`, `filename`, `collection` and `submitted_by`.
+watchman emits `file.published` once the file is in the library, with the curator who approved it as `actor` (`watchman` when the moderation policy approved it automatically). `submission.decided` has the curator as `actor`, and its `data` holds `submission_id`, `decision` (`approved` or `rejected`), `reason`, `filename`, `collection` and `submitted_by`.
 
 ### 4.4 Main flow: from submission to answer
 
@@ -365,8 +365,8 @@ The platform runs on a **Raspberry Pi 4 Model B (8 GB)** with a **USB SSD** for 
 | `POST` | `/submissions/{id}/approve` | curator | Approve; the file is moved into the library asynchronously |
 | `POST` | `/submissions/{id}/reject` | curator | Reject with a mandatory reason; the quarantined file is deleted |
 | `GET` | `/collections` | member | Library collections (top-level folders) that accept submissions |
-| `GET` | `/policies` | curator | Current moderation policy |
-| `PUT` | `/policies` | curator | Replace the policy (validated and versioned) |
+| `GET` | `/policies` | curator | Active moderation policy, with its version and author |
+| `PUT` | `/policies` | curator | Replace the policy (validated and versioned; it applies to new submissions only) |
 | `POST` | `/internal/webhooks/nextcloud` | Nextcloud (shared secret) | File-event webhook (`NodeRenamedEvent`, `NodeDeletedEvent` in the library), republished as `file.renamed` / `file.removed`. Not exposed through the ingress |
 
 `POST /submissions` → `202 Accepted`
@@ -395,6 +395,8 @@ The platform runs on a **Raspberry Pi 4 Model B (8 GB)** with a **USB SSD** for 
 
 Each check gives `pass` or `fail`. The quota check can also be `unavailable` (observer did not answer in time, so the submission waits for a curator and is never approved automatically) or `skipped` (another check already failed). When a check fails, the submission is stored as `rejected` and the answer is `422` with its `submission_id`, the `checks` and a machine-readable `reason`. If several checks fail, the reason is the first one in this list: `file_too_large`, `blocked_type`, `mime_mismatch` (the content does not match the extension), `duplicate` (with `existing_path`), `quota_exceeded`. A request whose `Content-Length` is far over the size limit gets `413` before its body is read.
 
+When every check passes, the submission is `pending_review`, or `approved` straight away if the policy's auto-approve rule matches (see `PUT /policies` below): the answer is still `202`, and watchman publishes the file as if a curator had approved it.
+
 `GET /collections` → `200 OK`: `{ "items": [{ "name": "Manuals", "path": "Library/Manuals" }, ...], "total": 6 }`
 
 `GET /submissions` → `200 OK`: the list format of section 5.1, newest first, each item like the `POST /submissions` answer. `?status=pending_review` gives the submissions waiting for a curator.
@@ -420,6 +422,18 @@ Each check gives `pass` or `fail`. The quota check can also be `unavailable` (ob
   "auto_approve": { "groups": ["trusted"], "max_size_bytes": 10485760 }
 }
 ```
+
+→ `200 OK` with the new version, in the same format as `GET /policies`:
+
+```json
+{ "version": 2, "created_by": "carol", "created_at": "2026-10-20T09:12:44Z", "policy": { "max_size_bytes": 52428800, ... } }
+```
+
+Every field of the document is required, and unknown fields are refused. MIME types are `type/subtype` or `type/*` and extensions are a dot and letters or digits, both stored in lowercase; `auto_approve.max_size_bytes` cannot be larger than `max_size_bytes`. An invalid document gets `422` with the list of `errors` (`loc`, `msg`, `type`), and nothing is stored.
+
+Each `PUT` stores a new version with the curator who saved it, and the latest version is the active one. Older versions stay in watchman's database, and each submission records the version it was checked with, so a change only applies to new submissions. The first version, created with the database, is the example above.
+
+**Auto-approve.** A submission is approved without a curator when the submitter is in one of `auto_approve.groups`, the file is not larger than `auto_approve.max_size_bytes` and every check passed. A quota check that is `unavailable` is not a pass, so nothing is approved automatically while observer is down. The status history records the change `checking → approved` with `watchman` as the actor and `auto_approve` as the reason. An empty `groups` list turns the rule off.
 
 ### 5.3 librarian - RAG and semantic search
 
@@ -626,7 +640,8 @@ Accounts created on the first start, with the passwords from `.env`:
 | `admin` (`NEXTCLOUD_ADMIN_USER`) | admin | Nextcloud administrator |
 | `alexandria` | admin | Service account: owns `Library` and `Quarantine`, sends notifications |
 | `observer` | sub-admin of `members` | Reads the members' storage usage |
-| `alice`, `bob` | members | Demo members |
+| `alice` | members | Demo member |
+| `bob` | members, trusted | Demo member whose submissions the default policy can approve automatically (5.2) |
 | `carol` | members, curators | Demo curator |
 
 ### 7.6 Resources
@@ -741,7 +756,7 @@ A new push to a pull request cancels the run that was in progress for it. Runs o
 | `lint` | `ruff check` and `ruff format --check` on `services/`, hadolint on the three Dockerfiles, and `docker compose config` with a copy of `.env.example` |
 | `test` | One job per service. It installs the locked dependencies with `uv sync --locked` and runs the unit and integration tests with pytest. PostgreSQL with pgvector and Redis run as service containers, from the same images as in `compose.yaml`. Nextcloud is mocked |
 | `build` | One job per service and architecture. It builds the image for `linux/amd64` on an x64 runner and for `linux/arm64` on an Arm runner, with a layer cache per service and architecture. On `main` and on tags it also pushes the image to GHCR by digest, without a tag |
-| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): files are submitted through watchman, a curator approves one (it must appear in the library) and rejects another, and each result is checked in Nextcloud, PostgreSQL and Redis |
+| `smoke` | Starts the local environment of section 7 from a clean checkout: `cp .env.example .env` and `docker compose up -d --build --wait`, without the `llm` profile. It fails if an image does not build, a container does not become healthy or the `bootstrap` job fails. Then it requests Nextcloud's `status.php` and each service's `/healthz` through the published ports, and runs [`tests/smoke/smoke.sh`](tests/smoke/smoke.sh): files are submitted through watchman, a curator approves one (it must appear in the library) and rejects another, reads the moderation policy and saves it as a new version, and each result is checked in Nextcloud, PostgreSQL and Redis |
 | `publish` | Only on `main` and on tags, once the four jobs above have passed. One job per service: it joins the two images pushed by `build` into one multi-arch image and gives it its tags (9.3) |
 | `ci-ok` | Fails unless every other job succeeded (`publish` is skipped on pull requests). It is the only status check that the `main` ruleset requires, so the ruleset does not depend on the names of the matrix jobs |
 
