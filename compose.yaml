@@ -136,8 +136,37 @@ services:
       timeout: 5s
       retries: 3
 
+  # Sends Nextcloud's webhook calls to watchman as soon as they are queued,
+  # instead of on the next cron run.
+  nextcloud-webhooks:
+    image: nextcloud:35.0.3-apache
+    restart: unless-stopped
+    user: www-data
+    entrypoint:
+      - php
+      - /var/www/html/occ
+      - background-job:worker
+      - 'OCA\WebhookListeners\BackgroundJobs\WebhookCall'
+    depends_on:
+      nextcloud:
+        condition: service_healthy
+      # Nextcloud does not send a failed call again, so wait for watchman.
+      watchman:
+        condition: service_healthy
+    environment: *nextcloud-env
+    volumes: *nextcloud-volumes
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "busybox ps | grep -q '[b]ackground-job:worker'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+
   # One-shot job: creates the library folders, the share with the members and
-  # the sub-admin rights. It is idempotent and runs on every "up".
+  # the sub-admin rights, and registers watchman's webhook. It is idempotent
+  # and runs on every "up".
   bootstrap:
     image: ghcr.io/feglez/alexandria-watchman:${IMAGE_TAG:-dev}
     command: ["python", "-m", "watchman.bootstrap"]
@@ -151,6 +180,8 @@ services:
       NEXTCLOUD_SERVICE_USER: alexandria
       NEXTCLOUD_SERVICE_PASSWORD: ${ALEXANDRIA_SERVICE_PASSWORD}
       LIBRARY_COLLECTIONS: ${LIBRARY_COLLECTIONS:-Manuals,Invoices,Contracts,Medical,School,Taxes}
+      WEBHOOK_URL: http://watchman:8001/internal/webhooks/nextcloud
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?set WEBHOOK_SECRET in .env}
     networks: [backend]
 
   ollama:
@@ -204,6 +235,8 @@ services:
       # submissions wait for a curator, so watchman does not depend on it.
       OBSERVER_INTERNAL_URL: http://observer:8001
       OBSERVER_INTERNAL_TOKEN: ${OBSERVER_INTERNAL_TOKEN:?set OBSERVER_INTERNAL_TOKEN in .env}
+      # Secret of Nextcloud's webhook calls to the internal port.
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}
     networks: [frontend, backend]
     ports:
       - 127.0.0.1:8081:8000
@@ -220,6 +253,9 @@ services:
         condition: service_healthy
       nextcloud:
         condition: service_healthy
+      # bootstrap creates the Library folder that librarian indexes.
+      bootstrap:
+        condition: service_completed_successfully
       ollama-pull:
         condition: service_completed_successfully
         # Without the "llm" profile librarian still starts.
@@ -229,6 +265,9 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
       NEXTCLOUD_URL: http://nextcloud
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      # Reads the files of the library to index them.
+      NEXTCLOUD_SERVICE_USER: alexandria
+      NEXTCLOUD_SERVICE_PASSWORD: ${ALEXANDRIA_SERVICE_PASSWORD}
     networks: [frontend, backend]
     ports:
       - 127.0.0.1:8082:8000
