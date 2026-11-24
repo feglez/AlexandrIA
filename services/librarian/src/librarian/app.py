@@ -4,7 +4,7 @@ from importlib.metadata import version
 
 from fastapi import FastAPI
 
-from librarian.api import health, search
+from librarian.api import documents, health, reindex, search
 from librarian.problems import install_problem_handlers
 from librarian.resources import Resources
 
@@ -15,4 +15,6 @@ def create_public_app(resources: Resources) -> FastAPI:
     install_problem_handlers(app)
     app.include_router(health.router)
     app.include_router(search.router)
+    app.include_router(documents.router)
+    app.include_router(reindex.router)
     return app
