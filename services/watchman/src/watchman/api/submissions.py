@@ -2,10 +2,11 @@
 
 The request is authenticated before its body is read. The body is a
 multipart form with the fields `file`, `collection` and `note`. The file is
-checked; if every check passes it is stored in the quarantine folder and the
-submission waits for a curator (`pending_review`). If a check fails the
-submission is recorded as `rejected` and the answer is a 422 problem with the
-reason.
+checked against the active moderation policy. If every check passes it is
+stored in the quarantine folder, and the submission either waits for a curator
+(`pending_review`) or, when the policy's auto-approve rule matches, is
+`approved` at once and the mover publishes it. If a check fails the submission
+is recorded as `rejected` and the answer is a 422 problem with the reason.
 """
 
 import logging
@@ -22,12 +23,14 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData, UploadFile
 from ulid import ULID
 
-from watchman import checks
+from watchman import checks, rules
 from watchman.api.collections import library_collections
 from watchman.auth import CurrentUser, User
 from watchman.db.models import LibraryFile, StatusChange, Submission
 from watchman.db.session import DbSession
 from watchman.files import FilesError, NextcloudFiles
+from watchman.lifecycle import check_transition
+from watchman.mover import ACTOR as WATCHMAN
 from watchman.policy import ActivePolicy, Policy
 from watchman.problems import Problem
 from watchman.resources import Resources
@@ -125,16 +128,26 @@ async def submit(
         await session.commit()
         results = await _run_checks(resources, user, facts, filename, policy, existing_path)
         rejected = checks.rejection(results)
+        status = rules.status_after_checks(policy, user.groups, facts.size_bytes, results)
+        check_transition("checking", status)
         submission.checks = [check.to_json() for check in results]
-        submission.status = "rejected" if rejected else "pending_review"
+        submission.status = status
         submission.created_at = submission.updated_at = datetime.now(UTC)
+        if status == "approved":
+            # Due at once for the mover.
+            submission.next_attempt_at = submission.created_at
 
-        if rejected is None:
+        if status != "rejected":
             submission.quarantine_path = f"{folder}/{filename}"
             await _store_in_quarantine(
                 resources.files, folder, submission.quarantine_path, upload, facts.size_bytes
             )
 
+    # When the policy approves it, the actor is watchman itself, as in the mover's changes.
+    if status == "approved":
+        actor, reason = WATCHMAN, rules.AUTO_APPROVED
+    else:
+        actor, reason = user.id, rejected[0].reason if rejected else None
     try:
         session.add(submission)
         await session.flush()
@@ -143,8 +156,8 @@ async def submit(
                 submission_id=submission.id,
                 from_status="checking",
                 to_status=submission.status,
-                actor=user.id,
-                reason=rejected[0].reason if rejected else None,
+                actor=actor,
+                reason=reason,
             )
         )
         await session.commit()
@@ -153,6 +166,8 @@ async def submit(
             await _discard(resources.files, folder)
         raise
 
+    if status == "approved":
+        resources.mover_wakeup.set()
     await _publish_created(resources, submission)
 
     if rejected is not None:
