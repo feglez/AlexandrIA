@@ -2,8 +2,8 @@
 
 The library contribution is the sum of every change up to the end of the
 month (files published minus files removed); the other figures count the
-events of that month only. Until a member has a quota of their own, the
-default one applies.
+events of that month only. The quotas are the member's own ones, or else the
+default ones.
 """
 
 from datetime import UTC, datetime
@@ -11,14 +11,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel
-from sqlalchemy import ColumnElement, Row, Select, case, func, select
-from sqlalchemy.orm import InstrumentedAttribute
+from sqlalchemy import Row, func, select
 
 from observer.auth import CurrentCurator, CurrentUser
-from observer.config import Settings
 from observer.db.models import UsageTotal
 from observer.db.session import DbSession
-from observer.ledger import period_of
+from observer.ledger import period_of, totals
+from observer.quotas import Quota, quotas_of
 from observer.resources import Resources
 
 router = APIRouter(prefix="/api/v1", tags=["usage"])
@@ -73,26 +72,7 @@ class UsagePage(BaseModel):
     offset: int
 
 
-def _sum_in(period: str, column: InstrumentedAttribute[int]) -> ColumnElement[int]:
-    return func.sum(case((UsageTotal.period == period, column), else_=0))
-
-
-def _totals(period: str) -> Select:
-    """One row per member with usage up to the end of the period."""
-    return (
-        select(
-            UsageTotal.member,
-            func.sum(UsageTotal.contributed_bytes).label("contributed_bytes"),
-            _sum_in(period, UsageTotal.submissions).label("submissions"),
-            _sum_in(period, UsageTotal.searches).label("searches"),
-            _sum_in(period, UsageTotal.questions).label("questions"),
-        )
-        .where(UsageTotal.period <= period)
-        .group_by(UsageTotal.member)
-    )
-
-
-def _member_usage(settings: Settings, member: str, row: Row | None) -> MemberUsage:
+def _member_usage(member: str, row: Row | None, quota: Quota) -> MemberUsage:
     def value(name: str) -> int:
         # PostgreSQL sums bigint columns as numeric.
         return int(getattr(row, name)) if row is not None else 0
@@ -100,11 +80,10 @@ def _member_usage(settings: Settings, member: str, row: Row | None) -> MemberUsa
     return MemberUsage(
         user=member,
         library_contribution=Contribution(
-            used_bytes=value("contributed_bytes"),
-            quota_bytes=settings.default_max_contribution_bytes,
+            used_bytes=value("contributed_bytes"), quota_bytes=quota.max_contribution_bytes
         ),
         submissions=Submissions(
-            this_period=value("submissions"), limit=settings.default_max_submissions_per_month
+            this_period=value("submissions"), limit=quota.max_submissions_per_month
         ),
         searches=Count(this_period=value("searches")),
         questions=Count(this_period=value("questions")),
@@ -116,8 +95,9 @@ async def my_usage(request: Request, user: CurrentUser, session: DbSession) -> M
     """My usage this month (UTC) and my personal storage in Nextcloud."""
     resources: Resources = request.app.state.resources
     period = period_of(datetime.now(UTC))
-    row = (await session.execute(_totals(period).where(UsageTotal.member == user.id))).first()
-    usage = _member_usage(resources.settings, user.id, row)
+    row = (await session.execute(totals(period).where(UsageTotal.member == user.id))).first()
+    quotas = await quotas_of(session, resources.settings, [user.id])
+    usage = _member_usage(user.id, row, quotas[user.id])
     storage = await resources.storage.usage(user.id)
     return MyUsage(
         user=user.id,
@@ -142,12 +122,15 @@ async def members_usage(
     month, UTC), ordered by user name."""
     resources: Resources = request.app.state.resources
     period = period or period_of(datetime.now(UTC))
-    query = _totals(period)
+    query = totals(period)
     total = await session.scalar(select(func.count()).select_from(query.subquery()))
-    rows = await session.execute(query.order_by(UsageTotal.member).limit(limit).offset(offset))
+    rows = (
+        await session.execute(query.order_by(UsageTotal.member).limit(limit).offset(offset))
+    ).all()
+    quotas = await quotas_of(session, resources.settings, [row.member for row in rows])
     return UsagePage(
         period=period,
-        items=[_member_usage(resources.settings, row.member, row) for row in rows],
+        items=[_member_usage(row.member, row, quotas[row.member]) for row in rows],
         total=total or 0,
         limit=limit,
         offset=offset,
