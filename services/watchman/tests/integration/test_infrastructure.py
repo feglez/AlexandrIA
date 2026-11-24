@@ -20,6 +20,7 @@ async def test_service_reaches_postgres_and_redis(
         redis_url=redis_url,
         nextcloud_service_password="service-password",
         observer_internal_token="observer-token",
+        webhook_secret="webhook-secret",
     )
     resources = Resources.from_settings(settings)
     try:

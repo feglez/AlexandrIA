@@ -212,8 +212,8 @@ class Mover:
             submission.next_attempt_at = None
             submission.last_error = None
             submission.updated_at = datetime.now(UTC)
-            # Files deleted in Nextcloud are only forgotten here once the
-            # webhooks exist, so an old row may still hold this path or id.
+            # A file deleted in Nextcloud whose webhook was missed leaves an
+            # old row that may still hold this path or id.
             await session.execute(
                 delete(LibraryFile).where(
                     or_(LibraryFile.path == path, LibraryFile.file_id == file_id)

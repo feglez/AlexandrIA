@@ -8,7 +8,7 @@ from importlib.metadata import version
 
 from fastapi import FastAPI
 
-from watchman.api import collections, health, policies, review, submissions
+from watchman.api import collections, health, policies, review, submissions, webhooks
 from watchman.problems import install_problem_handlers
 from watchman.resources import Resources
 
@@ -29,4 +29,5 @@ def create_internal_app(resources: Resources) -> FastAPI:
     app = FastAPI(title="watchman internal API", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.resources = resources
     install_problem_handlers(app)
+    app.include_router(webhooks.router)
     return app
