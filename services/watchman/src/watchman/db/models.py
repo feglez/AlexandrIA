@@ -3,7 +3,17 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, MetaData, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    ForeignKey,
+    Integer,
+    MetaData,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import DateTime
@@ -54,6 +64,14 @@ class Submission(Base):
     checks: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
     # Path of the file in the service account's home, while it is in quarantine.
     quarantine_path: Mapped[str | None] = mapped_column(Text)
+    # Publication by the mover. The target path and the Nextcloud file id are
+    # stored before each move, so a retry can tell whether an earlier move
+    # worked (the id stays the same when a file is moved).
+    library_path: Mapped[str | None] = mapped_column(Text)
+    file_id: Mapped[int | None] = mapped_column(BigInteger)
+    publish_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
