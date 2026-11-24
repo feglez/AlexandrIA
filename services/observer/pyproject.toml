@@ -1,0 +1,37 @@
+[project]
+name = "observer"
+version = "0.2.0"
+description = "AlexandrIA usage metering: usage ledger, quotas and monthly cost-split reports"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "alembic>=1.20",
+    "asyncpg>=0.32",
+    "fastapi>=0.165",
+    "httpx>=0.28",
+    "pydantic-settings>=2.16",
+    "python-ulid>=4.2",
+    "redis>=8.1",
+    "sqlalchemy[asyncio]>=2.1",
+    "uvicorn>=0.54",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2",
+    "pytest-asyncio>=1.5",
+    "respx>=0.23",
+    "ruff>=0.17",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.9,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.alembic]
+script_location = "%(here)s/src/observer/db/migrations"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"

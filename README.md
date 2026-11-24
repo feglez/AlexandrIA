@@ -12,6 +12,8 @@
 4. [Architecture](#4-architecture)
 5. [REST API specification](#5-rest-api-specification)
 6. [Engineering workflow](#6-engineering-workflow)
+7. [Local environment](#7-local-environment)
+8. [Container images](#8-container-images)
 
 ---
 
@@ -524,3 +526,175 @@ The platform runs on a **Raspberry Pi 4 Model B (8 GB)** with a **USB SSD** for 
 - **Commits:** [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`), with service scopes (`feat(watchman): ...`).
 - **User stories:** GitHub Issues created from the [user story template](.github/ISSUE_TEMPLATE/user_story.md), labelled `user-story`, with acceptance criteria and a task checklist, and assigned to a milestone per Hito. The initial backlog is in [`docs/backlog/`](docs/backlog).
 - **Pull requests:** [PR template](.github/PULL_REQUEST_TEMPLATE.md) linking the user story it closes.
+
+---
+
+## 7. Local environment
+
+[`compose.yaml`](compose.yaml) runs the whole platform on one machine: Nextcloud, the three services, PostgreSQL with pgvector, Redis and the LLM runtime (Ollama). It is the environment for development and tests; the deployment on the Raspberry Pi is described in section 4.5. It was tested with Docker Engine 29 and Docker Compose 5 on WSL 2 (amd64, 8 GB of RAM).
+
+### 7.1 Start and stop
+
+```bash
+cp .env.example .env
+docker compose up -d --wait
+docker compose ps
+```
+
+`--wait` returns once every container is healthy and the one-shot jobs (`bootstrap` and `ollama-pull`) have finished, and it exits with an error if any of them fails. The first time, compose builds the three service images from `services/`, Nextcloud installs itself and Ollama downloads the model.
+
+| Command | What it does |
+|---|---|
+| `docker compose down` | Removes the containers and the networks. The data stays in the named volumes |
+| `docker compose down -v` | Also deletes the volumes, so the next start installs Nextcloud from scratch |
+| `docker compose build` | Rebuilds the service images after a code change (the dependency layer stays cached, see 8.3) |
+| `COMPOSE_PROFILES= docker compose up -d --wait` | Starts everything except Ollama (see 7.5) |
+
+The Nextcloud web interface is at <http://localhost:8080>, and the services at `http://localhost:8081` (watchman), `:8082` (librarian) and `:8083` (observer). At this stage the services only answer `GET /healthz`; the endpoints of section 5 arrive with their user stories.
+
+### 7.2 Containers
+
+| Service | Image | Networks | Host port | Role |
+|---|---|---|---|---|
+| `postgres` | `pgvector/pgvector:0.8.7-pg17-trixie` | backend | none | One database and one role per component, created by [`01-databases.sh`](compose/postgres/initdb/01-databases.sh) on the first start. No role can connect to another component's database, and only `librarian` has the `vector` extension |
+| `redis` | `redis:8.8.4-alpine` | backend | none | Password protected, with an append-only file so the event stream survives restarts |
+| `nextcloud` | `nextcloud:35.0.3-apache` | frontend, backend | `127.0.0.1:8080` | Installs itself on the first start. Its post-installation hook [`10-alexandria.sh`](compose/nextcloud/hooks/post-installation/10-alexandria.sh) enables the `notifications` and `webhook_listeners` apps, switches background jobs to cron and creates the groups and the accounts (7.5) |
+| `nextcloud-cron` | `nextcloud:35.0.3-apache` | backend | none | Runs Nextcloud's background jobs every 5 minutes |
+| `bootstrap` | watchman image, `python -m watchman.bootstrap` | backend | none | One-shot job: creates `Library` with one folder per collection and `Quarantine`, shares `Library` read-only with the `members` group and makes `observer` a sub-admin of `members`. It checks what already exists, so it runs on every start |
+| `ollama` | `ollama/ollama:0.40.16` | backend, egress | none | LLM runtime (profile `llm`) |
+| `ollama-pull` | `ollama/ollama:0.40.16` | backend | none | One-shot job (profile `llm`): downloads `OLLAMA_MODEL` into the `ollama-models` volume if it is not there yet |
+| `watchman` | built from `services/watchman` | frontend, backend | `127.0.0.1:8081` | Curation workflow |
+| `librarian` | built from `services/librarian` | frontend, backend | `127.0.0.1:8082` | RAG and semantic search |
+| `observer` | built from `services/observer` | frontend, backend | `127.0.0.1:8083` | Usage, quotas and reports |
+
+**Start order and health checks.** Every long-running container has a health check: `pg_isready`, `redis-cli ping`, Nextcloud's `status.php` reporting `"installed":true`, the cron daemon, `ollama list`, and for our services a request to `/healthz` made with Python (the slim images have no curl). `depends_on` with `service_healthy` and `service_completed_successfully` starts PostgreSQL and Redis first, then Nextcloud, and then `bootstrap` and the services (watchman waits until `bootstrap` has finished). Each service applies its database migrations when it starts, under a PostgreSQL advisory lock so that several replicas can start at the same time.
+
+**Ports.** Only container port 8000 (public API) of each service is published. watchman and observer also listen on port 8001 for their internal endpoints (`/internal/*`, section 5), which is never published.
+
+### 7.3 Networks
+
+| Network | Containers | Purpose |
+|---|---|---|
+| `frontend` | nextcloud, watchman, librarian, observer | The only network with published ports, all bound to `127.0.0.1`, so they can only be opened from the host itself |
+| `backend` | all | `internal: true`, so it has no Internet access. It also sets `com.docker.network.bridge.inhibit_ipv4`, so the bridge gets no address on the host and the host cannot connect to the containers on it. PostgreSQL and Redis are only on this network and publish no ports |
+| `egress` | ollama | Internet access to download the model |
+
+`internal: true` alone was not enough: the host could still connect to PostgreSQL through the container's IP address. With `inhibit_ipv4` that connection fails, and the containers still reach each other by name.
+
+### 7.4 Volumes
+
+| Volume | Used by | Content |
+|---|---|---|
+| `postgres-data` | postgres | All the databases |
+| `redis-data` | redis | Append-only file with the event stream |
+| `nextcloud-html` | nextcloud, nextcloud-cron | Nextcloud installation and configuration |
+| `nextcloud-data` | nextcloud, nextcloud-cron | Users' files |
+| `ollama-models` | ollama | Downloaded models |
+
+Compose prefixes them with the project name (`alexandria_postgres-data`, ...). They survive `docker compose down` and are only deleted with `docker compose down -v`. The PostgreSQL init script and the Nextcloud hook only run when their volumes are empty, so after changing either of them, run `docker compose down -v` before the next start.
+
+### 7.5 Configuration and profiles
+
+Every setting comes from `.env`, a copy of [`.env.example`](.env.example). It only holds placeholders (`change-me-...`) for local use, and compose stops with an error if a required variable is missing. Passwords may only contain letters, digits, `-` and `_` because some of them go inside URLs, and Nextcloud needs at least 10 characters.
+
+- `COMPOSE_PROFILES=llm` includes Ollama in the default start. To run without the language model, use `COMPOSE_PROFILES= docker compose up -d --wait` or leave the variable empty in `.env`. librarian starts anyway, because its dependency on `ollama-pull` is marked `required: false`.
+- `IMAGE_TAG=dev` makes compose build the service images locally and tag them `ghcr.io/feglez/alexandria-<service>:dev`.
+- `OLLAMA_MODEL` (default `qwen2.5:1.5b`) and `LIBRARY_COLLECTIONS` (the top-level folders of the library).
+
+Accounts created on the first start, with the passwords from `.env`:
+
+| Account | Groups | Use |
+|---|---|---|
+| `admin` (`NEXTCLOUD_ADMIN_USER`) | admin | Nextcloud administrator |
+| `alexandria` | admin | Service account: owns `Library` and `Quarantine`, sends notifications |
+| `observer` | sub-admin of `members` | Reads the members' storage usage |
+| `alice`, `bob` | members | Demo members |
+| `carol` | members, curators | Demo curator |
+
+### 7.6 Resources
+
+Measured with `docker stats` and `docker images` on amd64:
+
+- **RAM:** about 0.65 GB for everything except Ollama. Ollama with `qwen2.5:1.5b` uses 0.4 to 0.6 GB when idle and about 2.1 GB while it generates an answer, so the whole stack needs about 2.75 GB. On a machine with less memory, use a smaller model such as `qwen2.5:0.5b`.
+- **Disk:** the Ollama image takes 8.5 GB (a 3.4 GB download, it includes GPU libraries) plus about 1 GB for the model, the Nextcloud image 2.1 GB, and our images the sizes in 8.7.
+
+How to run the linters and the tests is described in [CONTRIBUTING.md](CONTRIBUTING.md#local-development).
+
+---
+
+## 8. Container images
+
+Each service has a multi-stage Dockerfile in `services/<service>/Dockerfile`. watchman and observer use the same one (only the command changes), and librarian has an extra stage for the embedding model. [hadolint](https://github.com/hadolint/hadolint) reports no issues in any of them.
+
+### 8.1 Base image
+
+All stages use the official `python:3.13.18-slim-trixie` image, pinned to a patch release:
+
+- It is Debian with glibc. librarian needs onnxruntime (through fastembed), which only publishes `manylinux` wheels for Linux, built for glibc.
+- It is multi-arch, so the same Dockerfiles build for the Raspberry Pi (arm64).
+- It is small: its layers add up to about 43 MB compressed on amd64 in the registry, against about 414 MB for the full `python:3.13.18-trixie`. The full image adds compilers and development headers that we don't need, since every dependency installs from a prebuilt wheel.
+
+**Alpine** (`python:3.13.18-alpine`, about 17 MB compressed) was rejected. It uses musl, and onnxruntime has no wheels for musl, so librarian would have to build it from source. asyncpg and pydantic-core do publish musl wheels, so watchman and observer could run on Alpine, but using one base image for the three services means a single Python build to pin and update.
+
+**Distroless** (`gcr.io/distroless/python3-debian13`, Debian 13 with Python 3.13, no shell and no package manager, for amd64 and arm64) was tested as the runtime stage:
+
+- Copying the virtualenv built on the slim image does not work: its `python` is a link to the official image's interpreter in `/usr/local/bin`, while distroless ships Debian's interpreter in `/usr/bin`.
+- It does work when the build stage is `debian:trixie-slim` with Debian's `python3` package, which is the same interpreter that distroless ships. Built that way, watchman's compiled dependencies (asyncpg, pydantic-core, uvicorn) load with Debian's Python, and the service starts until it tries to connect to its database for the migrations (the test ran without a database). librarian computed embeddings with `--network none`.
+- watchman went from 277 MB to 191 MB of disk usage (64.8 MB to 44.4 MB compressed). librarian went from 1.04 GB to 958 MB (358 MB to 337 MB compressed), because the model and onnxruntime take most of its space.
+
+The services stay on slim. With distroless, the Python release would be the one Debian packages (3.13.5 at the time of the test, with Debian's security fixes) and it would change whenever the image is rebuilt upstream, because the distroless tags (`latest`, `nonroot`) have no version: the only way to pin it is by digest. With slim, the build and runtime stages use the same pinned image, so the virtualenv paths always match, and a shell is available to debug the local environment. The saving, about 20 MB per download for watchman and observer, does not make up for that.
+
+### 8.2 Stages
+
+watchman and observer:
+
+1. **`build`:** copies the `uv` binary from `ghcr.io/astral-sh/uv:0.13.9` and installs the dependencies and then the service into the virtualenv `/app/.venv` with `uv sync --locked --no-dev --no-editable`. Bytecode is compiled at build time (`UV_COMPILE_BYTECODE=1`), and uv always uses the image's Python (`UV_PYTHON_DOWNLOADS=0`), so the virtualenv also works in the runtime stage.
+2. **`runtime`:** a new slim image that only receives `/app/.venv`. uv, the build cache and the source tree stay behind; the service, including its migrations, is installed into `site-packages` as a regular package.
+
+librarian has four stages: `deps` (virtualenv with the dependencies), `model` (downloads the embedding model, see 8.6), `build` (installs the service) and `runtime` (virtualenv and model).
+
+### 8.3 Dependency layer
+
+```dockerfile
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    uv sync --locked --no-dev --no-install-project --no-editable
+```
+
+This layer only depends on `pyproject.toml` and `uv.lock`, which are mounted for the command instead of copied. A change in `src/` only rebuilds the `COPY src` and the final `uv sync` (checked with a code-only change: the dependency layer stays `CACHED`). The cache mount keeps the downloaded wheels between builds without adding them to the image, and `--locked` stops the build if `uv.lock` does not match `pyproject.toml`.
+
+### 8.4 Non-root user
+
+The runtime stage creates the system user and group `app` with the fixed id 10001 (no home directory, `nologin` shell) and switches to it with a numeric `USER 10001:10001`, so the container runtime can check that the image does not run as root without reading `/etc/passwd`. The virtualenv and librarian's model are owned by root, so the service cannot modify its own code. The containers also run with a read-only root filesystem (`--read-only`); librarian then needs a writable `/tmp`.
+
+```bash
+docker image inspect --format '{{.Config.User}}' ghcr.io/feglez/alexandria-watchman:dev   # 10001:10001
+```
+
+### 8.5 Ports
+
+| Image | `EXPOSE` | Use |
+|---|---|---|
+| watchman | 8000, 8001 | Public API; internal API (Nextcloud webhooks) |
+| observer | 8000, 8001 | Public API; internal API (quota checks) |
+| librarian | 8000 | Public API (it has no internal endpoints) |
+
+Both listeners run in the same process. Compose only publishes port 8000 (7.2).
+
+### 8.6 librarian: embedding model in the image
+
+The `model` stage downloads `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` with the locked fastembed version, which resolves it to the quantised ONNX export `Qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q` (384 dimensions, 241 MB). The runtime stage copies it to `/models` and points `FASTEMBED_CACHE_PATH` there. So the container needs no Internet access, starts without a download, and every image tag carries a fixed model. The stage starts from the dependency layer, so a code change does not download the model again. The image also sets `HF_HUB_OFFLINE=1` and `ORT_DISABLE_TELEMETRY=1`, and computing an embedding works with `--network none`.
+
+### 8.7 Sizes
+
+From `docker images` on amd64. "Compressed" is what a pull downloads; Docker 29's "disk usage" counts the unpacked layers plus the compressed download.
+
+| Image | Disk usage | Compressed |
+|---|---|---|
+| `python:3.13.18-slim-trixie` (base) | 178 MB | 45.3 MB |
+| `alexandria-watchman` | 277 MB | 64.8 MB |
+| `alexandria-observer` | 277 MB | 64.8 MB |
+| `alexandria-librarian` | 1.04 GB | 358 MB |
+
+watchman and observer add about 76 MB of virtualenv to the base image. In librarian, the virtualenv takes 287 MB (onnxruntime and numpy are the largest packages) and the model 241 MB.
