@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import (
 
 from observer.auth import NextcloudAuthenticator
 from observer.config import Settings
+from observer.storage import NextcloudStorage
 
 
 def nextcloud_client(settings: Settings) -> httpx.AsyncClient:
@@ -35,6 +36,7 @@ class Resources:
     redis: Redis
     nextcloud: httpx.AsyncClient
     authenticator: NextcloudAuthenticator
+    storage: NextcloudStorage
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Resources":
@@ -48,6 +50,9 @@ class Resources:
             redis=redis,
             nextcloud=nextcloud,
             authenticator=NextcloudAuthenticator(nextcloud, redis, settings.auth_cache_seconds),
+            storage=NextcloudStorage(
+                nextcloud, settings.nextcloud_observer_user, settings.nextcloud_observer_password
+            ),
         )
 
     async def aclose(self) -> None:
