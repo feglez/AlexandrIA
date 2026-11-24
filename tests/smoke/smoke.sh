@@ -19,6 +19,7 @@ set +a
 NEXTCLOUD_URL=${SMOKE_NEXTCLOUD_URL:-http://127.0.0.1:8080}
 WATCHMAN_URL=${SMOKE_WATCHMAN_URL:-http://127.0.0.1:8081}
 ALICE="alice:${DEMO_ALICE_PASSWORD}"
+BOB="bob:${DEMO_BOB_PASSWORD}"
 CAROL="carol:${DEMO_CAROL_PASSWORD}"
 SERVICE="alexandria:${ALEXANDRIA_SERVICE_PASSWORD}"
 DAV="$NEXTCLOUD_URL/remote.php/dav/files"
@@ -160,6 +161,53 @@ stored=$(query "SELECT to_status || ':' || actor || ':' || reason FROM status_hi
 step "A decided submission cannot be decided again"
 decide "$rejected" approve 409 -u "$CAROL"
 [[ $(field .current_status) == rejected ]] || fail "current_status is not rejected"
+
+POLICIES="$WATCHMAN_URL/api/v1/policies"
+
+step "carol reads the moderation policy"
+expect 200 -u "$CAROL" "$POLICIES"
+version=$(field .version)
+field '.policy.auto_approve.groups[]' | grep -qx trusted || fail "trusted is not an auto-approve group"
+jq -c .policy "$body" > "$work/policy.json"
+
+step "Members cannot read or change the policy"
+expect 403 -u "$ALICE" "$POLICIES"
+expect 403 -u "$ALICE" -X PUT "${json[@]}" -d "@$work/policy.json" "$POLICIES"
+
+step "An invalid policy is refused with the errors"
+expect 422 -u "$CAROL" -X PUT "${json[@]}" -d '{"max_size_bytes": 0}' "$POLICIES"
+errors=$(field '.errors[].loc | join(".")')
+grep -qx body.max_size_bytes <<< "$errors" || fail "no error for max_size_bytes"
+grep -qx body.auto_approve <<< "$errors" || fail "no error for the missing auto_approve"
+
+# Saving the same document keeps the policy as it was, so the test can run again.
+step "carol saves the policy, which becomes a new version"
+expect 200 -u "$CAROL" -X PUT "${json[@]}" -d "@$work/policy.json" "$POLICIES"
+new_version=$((version + 1))
+[[ $(field .version) == "$new_version" ]] || fail "version is not $new_version"
+[[ $(field .created_by) == carol ]] || fail "created_by is not carol"
+stored=$(query "SELECT string_agg(version || ':' || created_by, ' ' ORDER BY version)
+                FROM policies WHERE version >= $version")
+[[ $stored == "$version:"*" $new_version:carol" ]] || fail "versions: '$stored'"
+
+step "bob is in the trusted group"
+expect 200 -u "$BOB" -H "OCS-APIRequest: true" "$NEXTCLOUD_URL/ocs/v2.php/cloud/user?format=json"
+field '.ocs.data.groups[]' | grep -qx trusted || fail "bob is not in the trusted group"
+
+# observer serves no quota check yet, so the quota check is unavailable and
+# the auto-approve rule must not apply (fail-safe).
+step "bob is trusted, but without the quota check the file waits for a curator"
+trusted="smoke-$run_id-trusted.txt"
+printf 'From a trusted member, run %s.\n' "$run_id" > "$work/$trusted"
+expect 202 -u "$BOB" -F "file=@$work/$trusted" -F collection=Manuals \
+    "$WATCHMAN_URL/api/v1/submissions"
+[[ $(field .status) == pending_review ]] || fail "status is not pending_review"
+[[ $(field '.checks[] | select(.name == "quota") | .result') == unavailable ]] ||
+    fail "the quota check should be unavailable"
+stored=$(query "SELECT s.policy_version || ' ' || h.to_status || ':' || h.actor
+                FROM submissions s JOIN status_history h ON h.submission_id = s.id
+                WHERE s.id = '$(field .id)'")
+[[ $stored == "$new_version pending_review:bob" ]] || fail "database: '$stored'"
 
 step "A file whose content does not match its extension is rejected"
 printf 'Not a PDF, run %s.\n' "$run_id" > "$work/fake.pdf"
