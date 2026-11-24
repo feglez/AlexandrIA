@@ -8,7 +8,9 @@ POST   /api/v1/submissions/{id}/approve    curators; the mover publishes the fil
 POST   /api/v1/submissions/{id}/reject     curators; the quarantined file is deleted
 
 Every status change is stored in the status history with who made it and
-when. Curator decisions are published as `submission.decided`.
+when. Curator decisions are published as `submission.decided`. The member is
+notified in Nextcloud of a rejection here, and of the publication by the
+mover.
 """
 
 import asyncio
@@ -22,6 +24,7 @@ from redis.exceptions import RedisError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from watchman import notifications
 from watchman.api.submissions import SubmissionOut
 from watchman.auth import CurrentCurator, CurrentUser, User
 from watchman.db.models import SUBMISSION_STATUSES, StatusChange, Submission
@@ -207,6 +210,7 @@ async def reject(
     await session.commit()
 
     await _publish_decided(resources, submission, curator, body.reason)
+    await resources.notifier.send(notifications.rejected(submission, curator.id, body.reason))
     return SubmissionOut.model_validate(submission, from_attributes=True)
 
 

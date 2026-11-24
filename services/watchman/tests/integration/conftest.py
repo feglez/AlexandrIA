@@ -86,6 +86,7 @@ GROUPS = {
 ALLOWED = {"allowed": True, "remaining_bytes": 4_079_736_799, "remaining_submissions": 35}
 # Nextcloud file id of every quarantined file in the mocks.
 FILE_ID = 4182
+NOTIFICATIONS = f"{NEXTCLOUD}/ocs/v2.php/apps/notifications/api/v3/admin_notifications/"
 
 
 def nextcloud_user(request: httpx.Request) -> httpx.Response:
@@ -154,6 +155,9 @@ def mocked() -> respx.MockRouter:
             method="PROPFIND", url__startswith=f"{DAV}/Library/", name="target_id"
         ).respond(404)
         router.route(method="MOVE", url__startswith=f"{DAV}/Quarantine/", name="move").respond(201)
+        router.post(url__startswith=NOTIFICATIONS, name="notify").respond(
+            json={"ocs": {"meta": {"statuscode": 200}, "data": {"id": 1}}}
+        )
         yield router
 
 
