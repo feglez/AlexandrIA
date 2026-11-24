@@ -1,7 +1,8 @@
 """Entry point: `python -m librarian`.
 
 1. Apply the database migrations.
-2. Serve the API on PUBLIC_PORT. Scaling is done by running more containers.
+2. Load the embedding model.
+3. Serve the API on PUBLIC_PORT. Scaling is done by running more containers.
 """
 
 import asyncio
@@ -12,6 +13,7 @@ import uvicorn
 from librarian.app import create_public_app
 from librarian.config import Settings
 from librarian.db.migrate import upgrade_database
+from librarian.embeddings import Embedder, FastEmbedEmbedder
 from librarian.resources import Resources
 
 logger = logging.getLogger("librarian")
@@ -22,8 +24,8 @@ class _SkipHealthChecks(logging.Filter):
         return "/healthz" not in record.getMessage()
 
 
-async def serve(settings: Settings) -> None:
-    resources = Resources.from_settings(settings)
+async def serve(settings: Settings, embedder: Embedder) -> None:
+    resources = Resources.from_settings(settings, embedder)
     server = uvicorn.Server(
         uvicorn.Config(
             create_public_app(resources),
@@ -47,7 +49,12 @@ def main() -> None:
     logging.getLogger("uvicorn.access").addFilter(_SkipHealthChecks())
     logger.info("Applying database migrations")
     upgrade_database(settings.database_url)
-    asyncio.run(serve(settings))
+    logger.info("Loading the embedding model %s", settings.embedding_model)
+    embedder = FastEmbedEmbedder(settings.embedding_model)
+    try:
+        asyncio.run(serve(settings, embedder))
+    finally:
+        embedder.close()
 
 
 if __name__ == "__main__":

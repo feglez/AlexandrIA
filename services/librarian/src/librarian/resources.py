@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import (
 
 from librarian.auth import NextcloudAuthenticator
 from librarian.config import Settings
+from librarian.embeddings import Embedder
 
 
 def nextcloud_client(settings: Settings) -> httpx.AsyncClient:
@@ -35,9 +36,11 @@ class Resources:
     redis: Redis
     nextcloud: httpx.AsyncClient
     authenticator: NextcloudAuthenticator
+    embedder: Embedder
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "Resources":
+    def from_settings(cls, settings: Settings, embedder: Embedder) -> "Resources":
+        """The caller loads the embedder (the real model is slow to load) and closes it."""
         engine = create_async_engine(settings.database_url, pool_pre_ping=True)
         redis = Redis.from_url(settings.redis_url)
         nextcloud = nextcloud_client(settings)
@@ -48,6 +51,7 @@ class Resources:
             redis=redis,
             nextcloud=nextcloud,
             authenticator=NextcloudAuthenticator(nextcloud, redis, settings.auth_cache_seconds),
+            embedder=embedder,
         )
 
     async def aclose(self) -> None:
